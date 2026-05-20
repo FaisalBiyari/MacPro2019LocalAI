@@ -1,0 +1,157 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 04: Download and Install ROCm 7.2.3"
+mkdir -p ~/SetupFiles/rocm-7.2.3
+MKDIR_OK=$?
+cd ~/SetupFiles/rocm-7.2.3
+CD_OK=$?
+wget -nc "https://repo.radeon.com/rocm/installer/rocm-runfile-installer/rocm-rel-7.2.3/ubuntu/24.04/rocm-installer_1.2.8.70203-61-90~24.04.run"
+WGET_OK=$?
+bash rocm-installer_1.2.8.70203-61-90~24.04.run deps=install target="/" rocm force gpu-access=all postrocm
+ROCM_INSTALL_OK=$?
+mapfile -t PHASE04_INSTALL_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+[ "$MKDIR_OK" = 0 ]&&ok "Setup directory created"||bad "Setup directory creation failed"
+[ "$CD_OK" = 0 ]&&ok "Entered setup directory"||bad "Failed to enter setup directory"
+[ "$WGET_OK" = 0 ]&&ok "ROCm installer download: OK"||bad "ROCm installer download: FAIL"
+if [ -f "$HOME/SetupFiles/rocm-7.2.3/rocm-installer_1.2.8.70203-61-90~24.04.run" ];then
+  ok "ROCm installer file: present"
+else
+  bad "ROCm installer file: missing"
+fi
+if [ "$ROCM_INSTALL_OK" = 0 ];then
+  ok "ROCm runfile installer: OK"
+else
+  bad "ROCm runfile installer: FAIL"
+fi
+if [ -d /opt/rocm-7.2.3 ];then
+  ok "ROCm 7.2.3 directory: /opt/rocm-7.2.3"
+else
+  bad "ROCm 7.2.3 directory: missing"
+fi
+ROCM_ALT="$(update-alternatives --list rocm 2>/dev/null|tail -n 1||true)"
+if [ -n "$ROCM_ALT" ];then
+  ok "ROCm alternatives path: $ROCM_ALT"
+else
+  warn "ROCm alternatives path: not found"
+fi
+if command -v rocminfo >/dev/null 2>&1||[ -x /opt/rocm-7.2.3/bin/rocminfo ];then
+  ok "rocminfo binary: present"
+else
+  bad "rocminfo binary: missing"
+fi
+if command -v rocm-smi >/dev/null 2>&1||[ -x /opt/rocm-7.2.3/bin/rocm-smi ];then
+  ok "rocm-smi binary: present"
+else
+  bad "rocm-smi binary: missing"
+fi
+if command -v clinfo >/dev/null 2>&1;then
+  ok "clinfo binary: present"
+else
+  warn "clinfo binary: not found"
+fi
+)
+box "Phase 04 Install Checks" "${PHASE04_INSTALL_LINES[@]}"
+if printf "%s\n" "${PHASE04_INSTALL_LINES[@]}"|grep -q '^\[BAD\]';then
+  box "Error" "One or more install checks failed." "Do not reboot yet." "Review the output above."
+  exit 1
+fi
+(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+cmd(){ [ "$1" = 0 ]&&ok "$2: OK"||bad "$2: FAIL"; }
+ROCM_PATH="$(update-alternatives --list rocm 2>/dev/null|tail -n 1||true)"
+PATH="${ROCM_PATH:-/opt/rocm}/bin:$PATH"
+mapfile -t GPUS_RAW < <(lspci -nnk -d 1002:|awk 'function o(){if(g)print a"  driver: "d"  "n}/^[0-9a-fA-F:.]+ /{o();g=0;d="none"}/VGA compatible controller|Display controller|3D controller/{g=1;a=$1;n=$0;sub(/.*AMD\/ATI] /,"",n);sub(/ \[1002:.*/,"",n)}/Kernel driver in use:/&&g{d=$0;sub(/.*Kernel driver in use:[[:space:]]*/,"",d)}END{o()}')
+GPU_LINES=()
+if [ "${#GPUS_RAW[@]}" -eq 0 ];then
+  GPU_LINES+=("$(bad "none detected")")
+else
+  for g in "${GPUS_RAW[@]}";do
+    case "$g" in
+      *"driver: amdgpu"*) GPU_LINES+=("$(ok "$g")") ;;
+      *) GPU_LINES+=("$(bad "$g")") ;;
+    esac
+  done
+fi
+AMD_GPU_COUNT="${#GPUS_RAW[@]}"
+AMDGPU_BOUND_COUNT="$(printf "%s\n" "${GPUS_RAW[@]}"|grep -c 'driver: amdgpu'||true)"
+rocminfo >/tmp/rocminfo-check.log 2>&1
+ROCMINFO_OK=$?
+clinfo >/tmp/clinfo-check.log 2>&1
+CLINFO_OK=$?
+rocm-smi >/tmp/rocm-smi-check.log 2>&1
+ROCMSMI_OK=$?
+if ! command -v amd-smi >/dev/null 2>&1;then
+  AMDSMI_OK=127
+  AMDSMI_MSG="not found"
+elif amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK"
+elif sudo -n amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK via sudo"
+else
+  AMDSMI_OK=$?
+  AMDSMI_MSG="$(head -n 1 /tmp/amd-smi-check.log|sed 's/[[:space:]]\+/ /g')"
+  [ -n "$AMDSMI_MSG" ]||AMDSMI_MSG="failed"
+fi
+HSA_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*GPU' /tmp/rocminfo-check.log 2>/dev/null||true)"
+OPENCL_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*CL_DEVICE_TYPE_GPU' /tmp/clinfo-check.log 2>/dev/null||true)"
+banner "Verify AMDGPU And ROCm"
+box "AMD PCI GPUs" "${GPU_LINES[@]}"
+SUMMARY_LINES=()
+[ -n "$ROCM_PATH" ]&&SUMMARY_LINES+=("$(ok "ROCm path: $ROCM_PATH")")||SUMMARY_LINES+=("$(bad "ROCm path: not found")")
+[ "$AMD_GPU_COUNT" -gt 0 ]&&SUMMARY_LINES+=("$(ok "PCI AMD display GPUs: $AMD_GPU_COUNT")")||SUMMARY_LINES+=("$(bad "PCI AMD display GPUs: $AMD_GPU_COUNT")")
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$AMDGPU_BOUND_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$HSA_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$OPENCL_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+box "Summary" "${SUMMARY_LINES[@]}"
+CHECK_LINES=()
+[ "$ROCMINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocminfo: OK")")||CHECK_LINES+=("$(bad "rocminfo: FAIL")")
+[ "$CLINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "clinfo: OK")")||CHECK_LINES+=("$(bad "clinfo: FAIL")")
+[ "$ROCMSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocm-smi: OK")")||CHECK_LINES+=("$(bad "rocm-smi: FAIL")")
+[ "$AMDSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "amd-smi: $AMDSMI_MSG")")||CHECK_LINES+=("$(warn "amd-smi: $AMDSMI_MSG")")
+dkms status 2>/dev/null|grep -qi '^amdgpu/'&&CHECK_LINES+=("$(warn "AMDGPU DKMS installed: YES")")||CHECK_LINES+=("$(ok "AMDGPU DKMS installed: NO")")
+grep -q '^amdgpu ' /proc/modules&&CHECK_LINES+=("$(ok "amdgpu module loaded: YES")")||CHECK_LINES+=("$(bad "amdgpu module loaded: NO")")
+box "Checks" "${CHECK_LINES[@]}"
+rm -f /tmp/rocminfo-check.log /tmp/clinfo-check.log /tmp/rocm-smi-check.log /tmp/amd-smi-check.log
+)
+sed -i '/^export PATH="\$HOME\/\.local\/bin:\$PATH"$/d' ~/.bashrc
+grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ~/.bashrc || echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> ~/.bashrc
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+mapfile -t PHASE04_PATH_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+if grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ~/.bashrc;then
+  ok "PATH redundancy in ~/.bashrc: present"
+else
+  bad "PATH redundancy in ~/.bashrc: missing"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "Current PATH includes ~/.local/bin" ;;
+  *) warn "Current PATH does not include ~/.local/bin" ;;
+esac
+)
+box "Phase 04 PATH Checks" "${PHASE04_PATH_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
