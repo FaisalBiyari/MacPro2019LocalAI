@@ -1,0 +1,53 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 02: Install T2 Linux Repository"
+curl -s --compressed "https://adityagarg8.github.io/t2-ubuntu-repo/KEY.gpg" | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg >/dev/null
+sudo curl -s --compressed -o /etc/apt/sources.list.d/t2.list "https://adityagarg8.github.io/t2-ubuntu-repo/t2.list"
+CODENAME=noble
+echo "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/${CODENAME} ./" | sudo tee -a /etc/apt/sources.list.d/t2.list
+sudo apt update
+sudo apt install applesmc-t2 apple-bce t2fanrd -y
+mapfile -t PHASE02_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+if [ -s /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg ];then
+  ok "T2 repository key: installed"
+else
+  bad "T2 repository key: missing"
+fi
+if [ -s /etc/apt/sources.list.d/t2.list ];then
+  ok "T2 source list: installed"
+else
+  bad "T2 source list: missing"
+fi
+if grep -q "adityagarg8.github.io/t2-ubuntu-repo" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 main repo entry: present"
+else
+  warn "T2 main repo entry: check needed"
+fi
+if grep -q "github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/${CODENAME}" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 release repo entry: present"
+else
+  bad "T2 release repo entry: missing"
+fi
+if apt-cache policy 2>/dev/null|grep -qiE "adityagarg8.github.io/t2-ubuntu-repo|github.com/AdityaGarg8/t2-ubuntu-repo";then
+  ok "APT sees T2 repository"
+else
+  warn "APT does not clearly show T2 repository"
+fi
+pkg_ok applesmc-t2&&ok "Package applesmc-t2: installed"||bad "Package applesmc-t2: missing"
+pkg_ok apple-bce&&ok "Package apple-bce: installed"||bad "Package apple-bce: missing"
+pkg_ok t2fanrd&&ok "Package t2fanrd: installed"||bad "Package t2fanrd: missing"
+if systemctl list-unit-files t2fanrd.service >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  warn "t2fanrd service file: not detected"
+fi
+info "Phase 03 will enable and start t2fanrd."
+)
+box "Phase 02 Checks" "${PHASE02_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
