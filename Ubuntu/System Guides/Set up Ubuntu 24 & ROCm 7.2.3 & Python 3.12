@@ -1,0 +1,1285 @@
+# Setup / Install / Configure ROCm 7.2.3 for Ubuntu 24.04 T2 Linux AMD GPUs
+
+# Phase 01
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 01: Update, Upgrade, and Tweak the System"
+sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+sudo pro attach
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install linux-generic-hwe-24.04 -y
+sudo apt purge cloud-init -y
+sudo rm -rf /etc/cloud/ /var/lib/cloud/
+sudo apt autoremove -y
+sudo systemctl disable systemd-networkd-wait-online.service
+sudo systemctl mask systemd-networkd-wait-online.service
+sudo netplan generate
+sudo rm -r /etc/netplan/*.yaml
+sudo tee /etc/netplan/01-netplan-default.yaml >/dev/null <<'NETPLAN_EOF'
+network:
+  version: 2
+  ethernets:
+    all-interfaces:
+      match:
+        name: "*"
+      dhcp4: true
+      optional: true
+NETPLAN_EOF
+sudo chown root:root /etc/netplan/*.yaml
+sudo chmod 600 /etc/netplan/*.yaml
+sudo netplan apply
+sudo bash -c 'GRUB_LINE='\''GRUB_CMDLINE_LINUX_DEFAULT="loglevel=7 log_buf_len=16M iommu=pt"'\''; \
+(grep -Eq "^[[:space:]]*#?[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub && \
+sed -i -E "s|^[[:space:]]*#?[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=.*|$GRUB_LINE|" /etc/default/grub || \
+printf "\n%s\n" "$GRUB_LINE" >> /etc/default/grub) && \
+update-grub && \
+grep -nE "^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub'
+mapfile -t PHASE01_LINES < <(
+ok(){ echo "[OK]   $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cur_kernel="$(uname -r 2>/dev/null||echo unknown)"
+next_kernel="$(basename "$(readlink -f /boot/vmlinuz 2>/dev/null||true)"|sed 's/^vmlinuz-//')"
+grub_line="$(grep -E '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null||true)"
+netplan_files="$(find /etc/netplan -maxdepth 1 -name '*.yaml' 2>/dev/null|wc -l)"
+dhcp4="$(sudo netplan get ethernets.all-interfaces.dhcp4 2>/dev/null||true)"
+pro_attached="$(pro status 2>/dev/null|grep -q "Subscription:"&&echo yes||echo no)"
+wait_enabled="$(systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null||true)"
+wait_active="$(systemctl is-active systemd-networkd-wait-online.service 2>/dev/null||true)"
+info "Current kernel: $cur_kernel"
+if [ -n "$next_kernel" ];then
+  if [ "$cur_kernel" = "$next_kernel" ];then
+    ok "Booted kernel matches next boot kernel: $cur_kernel"
+  else
+    warn "Current kernel: $cur_kernel"
+    warn "Next boot kernel: $next_kernel"
+  fi
+else
+  warn "Next boot kernel: not detected"
+fi
+if [[ "$grub_line" == *"loglevel=7"* && "$grub_line" == *"log_buf_len=16M"* && "$grub_line" == *"iommu=pt"* ]];then
+  ok "GRUB flags: loglevel=7 log_buf_len=16M iommu=pt"
+else
+  warn "GRUB flags: check /etc/default/grub"
+fi
+if [ "$netplan_files" -gt 0 ];then
+  ok "Netplan YAML files: $netplan_files"
+else
+  warn "Netplan YAML files: missing"
+fi
+if [ "$dhcp4" = "true" ];then
+  ok "Netplan DHCPv4 all-interfaces: true"
+else
+  warn "Netplan DHCPv4 all-interfaces: check needed"
+fi
+if [ "$pro_attached" = "yes" ];then
+  ok "Ubuntu Pro: attached"
+else
+  warn "Ubuntu Pro: not attached"
+fi
+if [ "$wait_enabled" = "masked" ];then
+  ok "networkd-wait-online: masked"
+else
+  warn "networkd-wait-online enabled state: ${wait_enabled:-unknown}"
+fi
+if [ "$wait_active" != "active" ];then
+  ok "networkd-wait-online: not active"
+else
+  warn "networkd-wait-online: active"
+fi
+)
+box "Phase 01 Checks" "${PHASE01_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
+
+# Phase 02
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 02: Install T2 Linux Repository"
+curl -s --compressed "https://adityagarg8.github.io/t2-ubuntu-repo/KEY.gpg" | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg >/dev/null
+sudo curl -s --compressed -o /etc/apt/sources.list.d/t2.list "https://adityagarg8.github.io/t2-ubuntu-repo/t2.list"
+CODENAME=noble
+echo "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/${CODENAME} ./" | sudo tee -a /etc/apt/sources.list.d/t2.list
+sudo apt update
+sudo apt install applesmc-t2 apple-bce t2fanrd -y
+mapfile -t PHASE02_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+if [ -s /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg ];then
+  ok "T2 repository key: installed"
+else
+  bad "T2 repository key: missing"
+fi
+if [ -s /etc/apt/sources.list.d/t2.list ];then
+  ok "T2 source list: installed"
+else
+  bad "T2 source list: missing"
+fi
+if grep -q "adityagarg8.github.io/t2-ubuntu-repo" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 main repo entry: present"
+else
+  warn "T2 main repo entry: check needed"
+fi
+if grep -q "github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/${CODENAME}" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 release repo entry: present"
+else
+  bad "T2 release repo entry: missing"
+fi
+if apt-cache policy 2>/dev/null|grep -qiE "adityagarg8.github.io/t2-ubuntu-repo|github.com/AdityaGarg8/t2-ubuntu-repo";then
+  ok "APT sees T2 repository"
+else
+  warn "APT does not clearly show T2 repository"
+fi
+pkg_ok applesmc-t2&&ok "Package applesmc-t2: installed"||bad "Package applesmc-t2: missing"
+pkg_ok apple-bce&&ok "Package apple-bce: installed"||bad "Package apple-bce: missing"
+pkg_ok t2fanrd&&ok "Package t2fanrd: installed"||bad "Package t2fanrd: missing"
+if systemctl list-unit-files t2fanrd.service >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  warn "t2fanrd service file: not detected"
+fi
+info "Phase 03 will enable and start t2fanrd."
+)
+box "Phase 02 Checks" "${PHASE02_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
+
+# Phase 03
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 03: Enable T2 Fan Daemon"
+sudo systemctl enable --now t2fanrd
+sudo systemctl restart t2fanrd
+mapfile -t PHASE03_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+enabled="$(systemctl is-enabled t2fanrd 2>/dev/null||true)"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+pid="$(systemctl show -p MainPID --value t2fanrd 2>/dev/null||true)"
+if systemctl cat t2fanrd >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  bad "t2fanrd service file: missing"
+fi
+if [ "$enabled" = "enabled" ];then
+  ok "t2fanrd enabled: yes"
+else
+  bad "t2fanrd enabled: ${enabled:-unknown}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+if [ -n "$pid" ]&&[ "$pid" != "0" ];then
+  ok "t2fanrd MainPID: $pid"
+else
+  warn "t2fanrd MainPID: not detected"
+fi
+if [ -f /etc/t2fand.conf ];then
+  ok "t2fand config: /etc/t2fand.conf"
+else
+  warn "t2fand config: not found"
+fi
+info "Fan daemon setup complete."
+)
+box "Phase 03 Checks" "${PHASE03_LINES[@]}"
+
+# Phase 03 - Optional Addition
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+sudo bash -c 'cfg=/etc/t2fand.conf; tmp=$(mktemp); countfile=$(mktemp); awk '"'"'function flush_missing(){if(in_fan && !saw_afs){print "always_full_speed=true"; changed++} saw_afs=0} BEGIN{in_fan=0;saw_afs=0;changed=0;total_fans=0} /^\[Fan[0-9]+\][[:space:]]*$/{flush_missing(); in_fan=1; total_fans++; print; next} /^\[[^]]+\][[:space:]]*$/{flush_missing(); in_fan=0; print; next} /^[[:space:]]*always_full_speed[[:space:]]*=/{saw_afs=1; line=$0; val=line; sub(/^[^=]*=/,"",val); gsub(/[[:space:]]/,"",val); if(tolower(val)!="true"){sub(/=.*/,"=true",line); changed++} print line; next} {print} END{flush_missing(); printf "%d %d\n", changed, total_fans > "/dev/stderr"}'"'"' "$cfg" > "$tmp" 2> "$countfile"; read changed total < "$countfile"; mv "$tmp" "$cfg"; rm -f "$countfile"; echo "Fans changed to always_full_speed=true: $changed (Fan sections detected: $total)";'
+sudo systemctl restart t2fanrd
+mapfile -t PHASE03_FAN_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cfg="/etc/t2fand.conf"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+if sudo test -f "$cfg";then
+  ok "t2fand config: present"
+else
+  bad "t2fand config: missing"
+fi
+read fan_total full_speed_true full_speed_missing < <(
+  sudo awk '
+  function flush(){if(in_fan && !saw_afs) missing++; saw_afs=0}
+  BEGIN{in_fan=0;saw_afs=0;total=0;true_count=0;missing=0}
+  /^\[Fan[0-9]+\][[:space:]]*$/{flush();in_fan=1;total++;next}
+  /^\[[^]]+\][[:space:]]*$/{flush();in_fan=0;next}
+  in_fan && /^[[:space:]]*always_full_speed[[:space:]]*=/{
+    saw_afs=1
+    val=$0
+    sub(/^[^=]*=/,"",val)
+    gsub(/[[:space:]]/,"",val)
+    if(tolower(val)=="true") true_count++
+    next
+  }
+  END{flush();print total,true_count,missing}
+  ' "$cfg" 2>/dev/null || echo "0 0 0"
+)
+if [ "$fan_total" -gt 0 ] 2>/dev/null;then
+  ok "Fan sections detected: $fan_total"
+else
+  bad "Fan sections detected: 0"
+fi
+if [ "$fan_total" -gt 0 ] 2>/dev/null&&[ "$full_speed_true" -eq "$fan_total" ] 2>/dev/null&&[ "$full_speed_missing" -eq 0 ] 2>/dev/null;then
+  ok "always_full_speed=true: all fan sections"
+else
+  bad "always_full_speed=true: incomplete"
+  warn "Fan sections with full speed: ${full_speed_true:-0}/${fan_total:-0}"
+  warn "Fan sections missing setting: ${full_speed_missing:-0}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+info "Fans set to full speed."
+)
+box "Phase 03 Fan Checks" "${PHASE03_FAN_LINES[@]}"
+
+# Phase 04
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 04: Download and Install ROCm 7.2.3"
+mkdir -p ~/SetupFiles/rocm-7.2.3
+MKDIR_OK=$?
+cd ~/SetupFiles/rocm-7.2.3
+CD_OK=$?
+wget -nc "https://repo.radeon.com/rocm/installer/rocm-runfile-installer/rocm-rel-7.2.3/ubuntu/24.04/rocm-installer_1.2.8.70203-61-90~24.04.run"
+WGET_OK=$?
+bash rocm-installer_1.2.8.70203-61-90~24.04.run deps=install target="/" rocm force gpu-access=all postrocm
+ROCM_INSTALL_OK=$?
+mapfile -t PHASE04_INSTALL_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+[ "$MKDIR_OK" = 0 ]&&ok "Setup directory created"||bad "Setup directory creation failed"
+[ "$CD_OK" = 0 ]&&ok "Entered setup directory"||bad "Failed to enter setup directory"
+[ "$WGET_OK" = 0 ]&&ok "ROCm installer download: OK"||bad "ROCm installer download: FAIL"
+if [ -f "$HOME/SetupFiles/rocm-7.2.3/rocm-installer_1.2.8.70203-61-90~24.04.run" ];then
+  ok "ROCm installer file: present"
+else
+  bad "ROCm installer file: missing"
+fi
+if [ "$ROCM_INSTALL_OK" = 0 ];then
+  ok "ROCm runfile installer: OK"
+else
+  bad "ROCm runfile installer: FAIL"
+fi
+if [ -d /opt/rocm-7.2.3 ];then
+  ok "ROCm 7.2.3 directory: /opt/rocm-7.2.3"
+else
+  bad "ROCm 7.2.3 directory: missing"
+fi
+ROCM_ALT="$(update-alternatives --list rocm 2>/dev/null|tail -n 1||true)"
+if [ -n "$ROCM_ALT" ];then
+  ok "ROCm alternatives path: $ROCM_ALT"
+else
+  warn "ROCm alternatives path: not found"
+fi
+if command -v rocminfo >/dev/null 2>&1||[ -x /opt/rocm-7.2.3/bin/rocminfo ];then
+  ok "rocminfo binary: present"
+else
+  bad "rocminfo binary: missing"
+fi
+if command -v rocm-smi >/dev/null 2>&1||[ -x /opt/rocm-7.2.3/bin/rocm-smi ];then
+  ok "rocm-smi binary: present"
+else
+  bad "rocm-smi binary: missing"
+fi
+if command -v clinfo >/dev/null 2>&1;then
+  ok "clinfo binary: present"
+else
+  warn "clinfo binary: not found"
+fi
+)
+box "Phase 04 Install Checks" "${PHASE04_INSTALL_LINES[@]}"
+if printf "%s\n" "${PHASE04_INSTALL_LINES[@]}"|grep -q '^\[BAD\]';then
+  box "Error" "One or more install checks failed." "Do not reboot yet." "Review the output above."
+  exit 1
+fi
+(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+cmd(){ [ "$1" = 0 ]&&ok "$2: OK"||bad "$2: FAIL"; }
+ROCM_PATH="$(update-alternatives --list rocm 2>/dev/null|tail -n 1||true)"
+PATH="${ROCM_PATH:-/opt/rocm}/bin:$PATH"
+mapfile -t GPUS_RAW < <(lspci -nnk -d 1002:|awk 'function o(){if(g)print a"  driver: "d"  "n}/^[0-9a-fA-F:.]+ /{o();g=0;d="none"}/VGA compatible controller|Display controller|3D controller/{g=1;a=$1;n=$0;sub(/.*AMD\/ATI] /,"",n);sub(/ \[1002:.*/,"",n)}/Kernel driver in use:/&&g{d=$0;sub(/.*Kernel driver in use:[[:space:]]*/,"",d)}END{o()}')
+GPU_LINES=()
+if [ "${#GPUS_RAW[@]}" -eq 0 ];then
+  GPU_LINES+=("$(bad "none detected")")
+else
+  for g in "${GPUS_RAW[@]}";do
+    case "$g" in
+      *"driver: amdgpu"*) GPU_LINES+=("$(ok "$g")") ;;
+      *) GPU_LINES+=("$(bad "$g")") ;;
+    esac
+  done
+fi
+AMD_GPU_COUNT="${#GPUS_RAW[@]}"
+AMDGPU_BOUND_COUNT="$(printf "%s\n" "${GPUS_RAW[@]}"|grep -c 'driver: amdgpu'||true)"
+rocminfo >/tmp/rocminfo-check.log 2>&1
+ROCMINFO_OK=$?
+clinfo >/tmp/clinfo-check.log 2>&1
+CLINFO_OK=$?
+rocm-smi >/tmp/rocm-smi-check.log 2>&1
+ROCMSMI_OK=$?
+if ! command -v amd-smi >/dev/null 2>&1;then
+  AMDSMI_OK=127
+  AMDSMI_MSG="not found"
+elif amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK"
+elif sudo -n amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK via sudo"
+else
+  AMDSMI_OK=$?
+  AMDSMI_MSG="$(head -n 1 /tmp/amd-smi-check.log|sed 's/[[:space:]]\+/ /g')"
+  [ -n "$AMDSMI_MSG" ]||AMDSMI_MSG="failed"
+fi
+HSA_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*GPU' /tmp/rocminfo-check.log 2>/dev/null||true)"
+OPENCL_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*CL_DEVICE_TYPE_GPU' /tmp/clinfo-check.log 2>/dev/null||true)"
+banner "Verify AMDGPU And ROCm"
+box "AMD PCI GPUs" "${GPU_LINES[@]}"
+SUMMARY_LINES=()
+[ -n "$ROCM_PATH" ]&&SUMMARY_LINES+=("$(ok "ROCm path: $ROCM_PATH")")||SUMMARY_LINES+=("$(bad "ROCm path: not found")")
+[ "$AMD_GPU_COUNT" -gt 0 ]&&SUMMARY_LINES+=("$(ok "PCI AMD display GPUs: $AMD_GPU_COUNT")")||SUMMARY_LINES+=("$(bad "PCI AMD display GPUs: $AMD_GPU_COUNT")")
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$AMDGPU_BOUND_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$HSA_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$OPENCL_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+box "Summary" "${SUMMARY_LINES[@]}"
+CHECK_LINES=()
+[ "$ROCMINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocminfo: OK")")||CHECK_LINES+=("$(bad "rocminfo: FAIL")")
+[ "$CLINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "clinfo: OK")")||CHECK_LINES+=("$(bad "clinfo: FAIL")")
+[ "$ROCMSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocm-smi: OK")")||CHECK_LINES+=("$(bad "rocm-smi: FAIL")")
+[ "$AMDSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "amd-smi: $AMDSMI_MSG")")||CHECK_LINES+=("$(warn "amd-smi: $AMDSMI_MSG")")
+dkms status 2>/dev/null|grep -qi '^amdgpu/'&&CHECK_LINES+=("$(warn "AMDGPU DKMS installed: YES")")||CHECK_LINES+=("$(ok "AMDGPU DKMS installed: NO")")
+grep -q '^amdgpu ' /proc/modules&&CHECK_LINES+=("$(ok "amdgpu module loaded: YES")")||CHECK_LINES+=("$(bad "amdgpu module loaded: NO")")
+box "Checks" "${CHECK_LINES[@]}"
+rm -f /tmp/rocminfo-check.log /tmp/clinfo-check.log /tmp/rocm-smi-check.log /tmp/amd-smi-check.log
+)
+sed -i '/^export PATH="\$HOME\/\.local\/bin:\$PATH"$/d' ~/.bashrc
+grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ~/.bashrc || echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> ~/.bashrc
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+mapfile -t PHASE04_PATH_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+if grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ~/.bashrc;then
+  ok "PATH redundancy in ~/.bashrc: present"
+else
+  bad "PATH redundancy in ~/.bashrc: missing"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "Current PATH includes ~/.local/bin" ;;
+  *) warn "Current PATH does not include ~/.local/bin" ;;
+esac
+)
+box "Phase 04 PATH Checks" "${PHASE04_PATH_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
+
+# Phase 05
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 05: Install Python Tools"
+sudo apt install 2to3 python-is-python3 python3-pip python3-venv python3-dev python3-setuptools -y
+APT_PYTHON_TOOLS_OK=$?
+python3 -m pip install --upgrade pip wheel setuptools --break-system-packages
+PIP_TOOLS_OK=$?
+python3 -m pip install "numpy==1.26.4" --break-system-packages
+NUMPY_INSTALL_OK=$?
+mapfile -t PHASE05_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+[ "$APT_PYTHON_TOOLS_OK" = 0 ]&&ok "APT Python tools install: OK"||bad "APT Python tools install: FAIL"
+[ "$PIP_TOOLS_OK" = 0 ]&&ok "pip / wheel / setuptools upgrade: OK"||bad "pip / wheel / setuptools upgrade: FAIL"
+[ "$NUMPY_INSTALL_OK" = 0 ]&&ok "NumPy install: OK"||bad "NumPy install: FAIL"
+pkg_ok 2to3&&ok "Package 2to3: installed"||bad "Package 2to3: missing"
+pkg_ok python-is-python3&&ok "Package python-is-python3: installed"||bad "Package python-is-python3: missing"
+pkg_ok python3-pip&&ok "Package python3-pip: installed"||bad "Package python3-pip: missing"
+pkg_ok python3-venv&&ok "Package python3-venv: installed"||bad "Package python3-venv: missing"
+pkg_ok python3-dev&&ok "Package python3-dev: installed"||bad "Package python3-dev: missing"
+pkg_ok python3-setuptools&&ok "Package python3-setuptools: installed"||bad "Package python3-setuptools: missing"
+python3_ver="$(python3 --version 2>/dev/null||true)"
+python_ver="$(python --version 2>/dev/null||true)"
+pip_ver="$(python3 -m pip --version 2>/dev/null||true)"
+[ -n "$python3_ver" ]&&ok "python3: $python3_ver"||bad "python3: missing"
+[ -n "$python_ver" ]&&ok "python command: $python_ver"||bad "python command: missing"
+[ -n "$pip_ver" ]&&ok "pip: $pip_ver"||bad "pip: missing"
+wheel_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import wheel
+    print(wheel.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$wheel_ver" ]&&ok "wheel import: $wheel_ver"||bad "wheel import: FAIL"
+setuptools_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import setuptools
+    print(setuptools.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$setuptools_ver" ]&&ok "setuptools import: $setuptools_ver"||bad "setuptools import: FAIL"
+numpy_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import numpy
+    print(numpy.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+if [ "$numpy_ver" = "1.26.4" ];then
+  ok "NumPy import: $numpy_ver"
+elif [ -n "$numpy_ver" ];then
+  warn "NumPy import: $numpy_ver"
+  warn "Expected NumPy: 1.26.4"
+else
+  bad "NumPy import: FAIL"
+fi
+if python3 -m venv /tmp/linuxai-venv-check >/tmp/linuxai-venv-check.log 2>&1;then
+  ok "python3 venv creation: OK"
+else
+  bad "python3 venv creation: FAIL"
+  tail -n 2 /tmp/linuxai-venv-check.log 2>/dev/null|sed 's/^/[WARN] /'
+fi
+rm -rf /tmp/linuxai-venv-check /tmp/linuxai-venv-check.log
+info "Python tool setup complete."
+)
+box "Phase 05 Checks" "${PHASE05_LINES[@]}"
+
+# Phase 06
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 06: Install PyTorch & Other ROCm Related Wheels"
+mkdir -p ~/SetupFiles/rocm-7.2.3/wheels
+PHASE06_MKDIR_OK=$?
+cd ~/SetupFiles/rocm-7.2.3/wheels
+PHASE06_CD_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torch-2.10.0%2Brocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCH_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torchvision-0.25.0%2Brocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCHVISION_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torchaudio-2.10.0%2Brocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCHAUDIO_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/triton-3.6.0%2Brocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TRITON_OK=$?
+python3 -m pip uninstall torch torchvision triton torchaudio -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./torch-2.10.0+rocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl \
+./torchvision-0.25.0+rocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl \
+./torchaudio-2.10.0+rocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl \
+./triton-3.6.0+rocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl
+PHASE06_PIP_TORCH_STACK_OK=$?
+sudo mkdir -p /etc/apt/keyrings
+PHASE06_KEYRINGS_OK=$?
+curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+PHASE06_ROCM_KEY_OK=0
+for s in "${PIPESTATUS[@]}";do [ "$s" = 0 ]||PHASE06_ROCM_KEY_OK=1;done
+sudo chmod 644 /etc/apt/keyrings/rocm.gpg
+PHASE06_KEY_CHMOD_OK=$?
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.3 noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
+PHASE06_ROCM_LIST_OK=0
+for s in "${PIPESTATUS[@]}";do [ "$s" = 0 ]||PHASE06_ROCM_LIST_OK=1;done
+sudo tee /etc/apt/preferences.d/rocm-radeon-priority >/dev/null <<'EOF2'
+Package: *
+Pin: origin repo.radeon.com
+Pin-Priority: 700
+EOF2
+PHASE06_ROCM_PREF_OK=$?
+sudo apt update
+PHASE06_APT_UPDATE_OK=$?
+sudo rm -f \
+/opt/rocm-7.2.3/bin/amdclang \
+/opt/rocm-7.2.3/bin/amdclang++ \
+/opt/rocm-7.2.3/bin/amdclang-cl \
+/opt/rocm-7.2.3/bin/amdclang-cpp \
+/opt/rocm-7.2.3/bin/amdflang \
+/opt/rocm-7.2.3/bin/amdlld \
+/opt/rocm-7.2.3/bin/offload-arch
+PHASE06_REMOVE_CONFLICTS_OK=$?
+sudo apt install migraphx half -y
+PHASE06_APT_MIGRAPHX_HALF_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+PHASE06_WGET_ORT_OK=$?
+python3 -m pip uninstall onnxruntime onnxruntime-migraphx -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+PHASE06_PIP_ORT_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/tensorflow_rocm-2.20.0.dev0%2Bselfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl
+PHASE06_WGET_TF_OK=$?
+python3 -m pip uninstall tensorflow tensorflow-rocm tf-nightly-rocm -y --break-system-packages || true
+python3 -m pip install tf-keras --no-deps --break-system-packages
+PHASE06_PIP_TFKERAS_OK=$?
+python3 -m pip install --upgrade --break-system-packages \
+./tensorflow_rocm-2.20.0.dev0+selfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl
+PHASE06_PIP_TF_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/apex-1.10.0%2Brocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_APEX_OK=$?
+python3 -m pip uninstall apex -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./apex-1.10.0+rocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl
+PHASE06_PIP_APEX_OK=$?
+mapfile -t PHASE06_INSTALL_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+pip_ok(){ python3 -m pip show "$1" >/dev/null 2>&1; }
+file_ok(){ [ -f "$1" ]&&ok "$2: present"||bad "$2: missing"; }
+[ "$PHASE06_MKDIR_OK" = 0 ]&&ok "Wheels directory created"||bad "Wheels directory creation failed"
+[ "$PHASE06_CD_OK" = 0 ]&&ok "Entered wheels directory"||bad "Failed to enter wheels directory"
+[ "$PHASE06_WGET_TORCH_OK" = 0 ]&&ok "torch wheel download: OK"||bad "torch wheel download: FAIL"
+[ "$PHASE06_WGET_TORCHVISION_OK" = 0 ]&&ok "torchvision wheel download: OK"||bad "torchvision wheel download: FAIL"
+[ "$PHASE06_WGET_TORCHAUDIO_OK" = 0 ]&&ok "torchaudio wheel download: OK"||bad "torchaudio wheel download: FAIL"
+[ "$PHASE06_WGET_TRITON_OK" = 0 ]&&ok "triton wheel download: OK"||bad "triton wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torch-2.10.0+rocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl" "torch wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torchvision-0.25.0+rocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl" "torchvision wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torchaudio-2.10.0+rocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl" "torchaudio wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/triton-3.6.0+rocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl" "triton wheel file"
+[ "$PHASE06_PIP_TORCH_STACK_OK" = 0 ]&&ok "PyTorch stack install: OK"||bad "PyTorch stack install: FAIL"
+[ "$PHASE06_KEYRINGS_OK" = 0 ]&&ok "APT keyrings directory: OK"||bad "APT keyrings directory: FAIL"
+[ "$PHASE06_ROCM_KEY_OK" = 0 ]&&ok "ROCm APT key install: OK"||bad "ROCm APT key install: FAIL"
+[ "$PHASE06_KEY_CHMOD_OK" = 0 ]&&ok "ROCm APT key permissions: OK"||bad "ROCm APT key permissions: FAIL"
+[ "$PHASE06_ROCM_LIST_OK" = 0 ]&&ok "ROCm APT source list write: OK"||bad "ROCm APT source list write: FAIL"
+[ "$PHASE06_ROCM_PREF_OK" = 0 ]&&ok "ROCm APT priority write: OK"||bad "ROCm APT priority write: FAIL"
+[ "$PHASE06_APT_UPDATE_OK" = 0 ]&&ok "APT update after ROCm repo: OK"||bad "APT update after ROCm repo: FAIL"
+[ "$PHASE06_REMOVE_CONFLICTS_OK" = 0 ]&&ok "ROCm LLVM conflict cleanup: OK"||bad "ROCm LLVM conflict cleanup: FAIL"
+[ "$PHASE06_APT_MIGRAPHX_HALF_OK" = 0 ]&&ok "MIGraphX / half install: OK"||bad "MIGraphX / half install: FAIL"
+pkg_ok migraphx&&ok "Package migraphx: installed"||bad "Package migraphx: missing"
+pkg_ok half&&ok "Package half: installed"||bad "Package half: missing"
+[ "$PHASE06_WGET_ORT_OK" = 0 ]&&ok "ONNX Runtime MIGraphX wheel download: OK"||bad "ONNX Runtime MIGraphX wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" "ONNX Runtime MIGraphX wheel file"
+[ "$PHASE06_PIP_ORT_OK" = 0 ]&&ok "ONNX Runtime MIGraphX install: OK"||bad "ONNX Runtime MIGraphX install: FAIL"
+[ "$PHASE06_WGET_TF_OK" = 0 ]&&ok "TensorFlow ROCm wheel download: OK"||bad "TensorFlow ROCm wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/tensorflow_rocm-2.20.0.dev0+selfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl" "TensorFlow ROCm wheel file"
+[ "$PHASE06_PIP_TFKERAS_OK" = 0 ]&&ok "tf-keras install: OK"||bad "tf-keras install: FAIL"
+[ "$PHASE06_PIP_TF_OK" = 0 ]&&ok "TensorFlow ROCm install: OK"||bad "TensorFlow ROCm install: FAIL"
+[ "$PHASE06_WGET_APEX_OK" = 0 ]&&ok "Apex wheel download: OK"||bad "Apex wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/apex-1.10.0+rocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl" "Apex wheel file"
+[ "$PHASE06_PIP_APEX_OK" = 0 ]&&ok "Apex install: OK"||bad "Apex install: FAIL"
+pip_ok torch&&ok "pip package torch: installed"||bad "pip package torch: missing"
+pip_ok torchvision&&ok "pip package torchvision: installed"||bad "pip package torchvision: missing"
+pip_ok torchaudio&&ok "pip package torchaudio: installed"||bad "pip package torchaudio: missing"
+pip_ok triton&&ok "pip package triton: installed"||bad "pip package triton: missing"
+pip_ok onnxruntime-migraphx&&ok "pip package onnxruntime-migraphx: installed"||bad "pip package onnxruntime-migraphx: missing"
+pip_ok tensorflow-rocm&&ok "pip package tensorflow-rocm: installed"||bad "pip package tensorflow-rocm: missing"
+pip_ok tf-keras&&ok "pip package tf-keras: installed"||bad "pip package tf-keras: missing"
+pip_ok apex&&ok "pip package apex: installed"||bad "pip package apex: missing"
+info "Step 06 install checks complete."
+)
+box "Phase 06 Install Checks" "${PHASE06_INSTALL_LINES[@]}"
+if printf "%s\n" "${PHASE06_INSTALL_LINES[@]}"|grep -q '^\[BAD\]';then
+  box "Error" "One or more install checks failed." "Do not reboot yet." "Review the output above."
+  exit 1
+fi
+sudo apt update && sudo apt upgrade -y
+sudo apt autoremove -y
+banner "Installation Complete"
+box "Important" "The system will reboot now." "After reboot, the installation is complete."
+sudo reboot
+
+# Phase 07
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 07: Verify Installations"
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+mapfile -t PHASE01_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cur_kernel="$(uname -r 2>/dev/null||echo unknown)"
+next_kernel="$(basename "$(readlink -f /boot/vmlinuz 2>/dev/null||true)"|sed 's/^vmlinuz-//')"
+grub_line="$(grep -E '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null||true)"
+netplan_files="$(find /etc/netplan -maxdepth 1 -name '*.yaml' 2>/dev/null|wc -l)"
+dhcp4="$(sudo netplan get ethernets.all-interfaces.dhcp4 2>/dev/null||true)"
+pro_attached="$(pro status 2>/dev/null|grep -q "Subscription:"&&echo yes||echo no)"
+wait_enabled="$(systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null||true)"
+wait_active="$(systemctl is-active systemd-networkd-wait-online.service 2>/dev/null||true)"
+info "Current kernel: $cur_kernel"
+if [ -n "$next_kernel" ];then
+  if [ "$cur_kernel" = "$next_kernel" ];then
+    ok "Booted kernel matches next boot kernel: $cur_kernel"
+  else
+    warn "Current kernel: $cur_kernel"
+    warn "Next boot kernel: $next_kernel"
+  fi
+else
+  warn "Next boot kernel: not detected"
+fi
+if [[ "$grub_line" == *"loglevel=7"* && "$grub_line" == *"log_buf_len=16M"* && "$grub_line" == *"iommu=pt"* ]];then
+  ok "GRUB flags: loglevel=7 log_buf_len=16M iommu=pt"
+else
+  bad "GRUB flags: check /etc/default/grub"
+fi
+if [ "$netplan_files" -gt 0 ];then
+  ok "Netplan YAML files: $netplan_files"
+else
+  bad "Netplan YAML files: missing"
+fi
+if [ "$dhcp4" = "true" ];then
+  ok "Netplan DHCPv4 all-interfaces: true"
+else
+  bad "Netplan DHCPv4 all-interfaces: check needed"
+fi
+if [ "$pro_attached" = "yes" ];then
+  ok "Ubuntu Pro: attached"
+else
+  warn "Ubuntu Pro: not attached"
+fi
+if [ "$wait_enabled" = "masked" ];then
+  ok "networkd-wait-online: masked"
+else
+  warn "networkd-wait-online enabled state: ${wait_enabled:-unknown}"
+fi
+if [ "$wait_active" != "active" ];then
+  ok "networkd-wait-online: not active"
+else
+  warn "networkd-wait-online: active"
+fi
+)
+box "Phase 01 Checks" "${PHASE01_LINES[@]}"
+mapfile -t PHASE02_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+if [ -s /etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg ];then
+  ok "T2 repository key: installed"
+else
+  bad "T2 repository key: missing"
+fi
+if [ -s /etc/apt/sources.list.d/t2.list ];then
+  ok "T2 source list: installed"
+else
+  bad "T2 source list: missing"
+fi
+if grep -q "adityagarg8.github.io/t2-ubuntu-repo" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 main repo entry: present"
+else
+  warn "T2 main repo entry: check needed"
+fi
+if grep -q "github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/noble" /etc/apt/sources.list.d/t2.list 2>/dev/null;then
+  ok "T2 release repo entry: present"
+else
+  bad "T2 release repo entry: missing"
+fi
+if apt-cache policy 2>/dev/null|grep -qiE "adityagarg8.github.io/t2-ubuntu-repo|github.com/AdityaGarg8/t2-ubuntu-repo";then
+  ok "APT sees T2 repository"
+else
+  warn "APT does not clearly show T2 repository"
+fi
+pkg_ok applesmc-t2&&ok "Package applesmc-t2: installed"||bad "Package applesmc-t2: missing"
+pkg_ok apple-bce&&ok "Package apple-bce: installed"||bad "Package apple-bce: missing"
+pkg_ok t2fanrd&&ok "Package t2fanrd: installed"||bad "Package t2fanrd: missing"
+if systemctl cat t2fanrd >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  warn "t2fanrd service file: not detected"
+fi
+)
+box "Phase 02 Checks" "${PHASE02_LINES[@]}"
+mapfile -t PHASE03_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+enabled="$(systemctl is-enabled t2fanrd 2>/dev/null||true)"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+pid="$(systemctl show -p MainPID --value t2fanrd 2>/dev/null||true)"
+if systemctl cat t2fanrd >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  bad "t2fanrd service file: missing"
+fi
+if [ "$enabled" = "enabled" ];then
+  ok "t2fanrd enabled: yes"
+else
+  bad "t2fanrd enabled: ${enabled:-unknown}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+if [ -n "$pid" ]&&[ "$pid" != "0" ];then
+  ok "t2fanrd MainPID: $pid"
+else
+  warn "t2fanrd MainPID: not detected"
+fi
+if sudo test -f /etc/t2fand.conf;then
+  ok "t2fand config: /etc/t2fand.conf"
+else
+  warn "t2fand config: not found"
+fi
+)
+box "Phase 03 Daemon Checks" "${PHASE03_LINES[@]}"
+mapfile -t PHASE03_FAN_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cfg="/etc/t2fand.conf"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+if sudo test -f "$cfg";then
+  ok "t2fand config: present"
+else
+  bad "t2fand config: missing"
+fi
+read fan_total full_speed_true full_speed_missing < <(
+  sudo awk '
+  function flush(){if(in_fan && !saw_afs) missing++; saw_afs=0}
+  BEGIN{in_fan=0;saw_afs=0;total=0;true_count=0;missing=0}
+  /^\[Fan[0-9]+\][[:space:]]*$/{flush();in_fan=1;total++;next}
+  /^\[[^]]+\][[:space:]]*$/{flush();in_fan=0;next}
+  in_fan && /^[[:space:]]*always_full_speed[[:space:]]*=/{
+    saw_afs=1
+    val=$0
+    sub(/^[^=]*=/,"",val)
+    gsub(/[[:space:]]/,"",val)
+    if(tolower(val)=="true") true_count++
+    next
+  }
+  END{flush();print total,true_count,missing}
+  ' "$cfg" 2>/dev/null || echo "0 0 0"
+)
+if [ "$fan_total" -gt 0 ] 2>/dev/null;then
+  ok "Fan sections detected: $fan_total"
+else
+  bad "Fan sections detected: 0"
+fi
+if [ "$fan_total" -gt 0 ] 2>/dev/null&&[ "$full_speed_true" -eq "$fan_total" ] 2>/dev/null&&[ "$full_speed_missing" -eq 0 ] 2>/dev/null;then
+  ok "always_full_speed=true: all fan sections"
+else
+  bad "always_full_speed=true: incomplete"
+  warn "Fan sections with full speed: ${full_speed_true:-0}/${fan_total:-0}"
+  warn "Fan sections missing setting: ${full_speed_missing:-0}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+)
+box "Phase 03 Fan Checks" "${PHASE03_FAN_LINES[@]}"
+(
+ROCM_PATH="$(update-alternatives --list rocm 2>/dev/null|tail -n 1||true)"
+PATH="${ROCM_PATH:-/opt/rocm}/bin:$PATH"
+mapfile -t GPUS_RAW < <(lspci -nnk -d 1002:|awk 'function o(){if(g)print a"  driver: "d"  "n}/^[0-9a-fA-F:.]+ /{o();g=0;d="none"}/VGA compatible controller|Display controller|3D controller/{g=1;a=$1;n=$0;sub(/.*AMD\/ATI] /,"",n);sub(/ \[1002:.*/,"",n)}/Kernel driver in use:/&&g{d=$0;sub(/.*Kernel driver in use:[[:space:]]*/,"",d)}END{o()}')
+GPU_LINES=()
+if [ "${#GPUS_RAW[@]}" -eq 0 ];then
+  GPU_LINES+=("$(bad "none detected")")
+else
+  for g in "${GPUS_RAW[@]}";do
+    case "$g" in
+      *"driver: amdgpu"*) GPU_LINES+=("$(ok "$g")") ;;
+      *) GPU_LINES+=("$(bad "$g")") ;;
+    esac
+  done
+fi
+AMD_GPU_COUNT="${#GPUS_RAW[@]}"
+AMDGPU_BOUND_COUNT="$(printf "%s\n" "${GPUS_RAW[@]}"|grep -c 'driver: amdgpu'||true)"
+rocminfo >/tmp/rocminfo-check.log 2>&1
+ROCMINFO_OK=$?
+clinfo >/tmp/clinfo-check.log 2>&1
+CLINFO_OK=$?
+rocm-smi >/tmp/rocm-smi-check.log 2>&1
+ROCMSMI_OK=$?
+if ! command -v amd-smi >/dev/null 2>&1;then
+  AMDSMI_OK=127
+  AMDSMI_MSG="not found"
+elif amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK"
+elif sudo -n amd-smi >/tmp/amd-smi-check.log 2>&1;then
+  AMDSMI_OK=0
+  AMDSMI_MSG="OK via sudo"
+else
+  AMDSMI_OK=$?
+  AMDSMI_MSG="$(head -n 1 /tmp/amd-smi-check.log|sed 's/[[:space:]]\+/ /g')"
+  [ -n "$AMDSMI_MSG" ]||AMDSMI_MSG="failed"
+fi
+HSA_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*GPU' /tmp/rocminfo-check.log 2>/dev/null||true)"
+OPENCL_GPU_COUNT="$(grep -c 'Device Type:[[:space:]]*CL_DEVICE_TYPE_GPU' /tmp/clinfo-check.log 2>/dev/null||true)"
+box "AMD PCI GPUs" "${GPU_LINES[@]}"
+SUMMARY_LINES=()
+[ -n "$ROCM_PATH" ]&&SUMMARY_LINES+=("$(ok "ROCm path: $ROCM_PATH")")||SUMMARY_LINES+=("$(bad "ROCm path: not found")")
+[ "$AMD_GPU_COUNT" -gt 0 ]&&SUMMARY_LINES+=("$(ok "PCI AMD display GPUs: $AMD_GPU_COUNT")")||SUMMARY_LINES+=("$(bad "PCI AMD display GPUs: $AMD_GPU_COUNT")")
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$AMDGPU_BOUND_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Using kernel amdgpu: $AMDGPU_BOUND_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$HSA_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to ROCm/HSA: $HSA_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+if [ "$AMD_GPU_COUNT" -gt 0 ]&&[ "$OPENCL_GPU_COUNT" -eq "$AMD_GPU_COUNT" ];then
+  SUMMARY_LINES+=("$(ok "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+else
+  SUMMARY_LINES+=("$(bad "Visible to OpenCL: $OPENCL_GPU_COUNT / $AMD_GPU_COUNT")")
+fi
+box "Phase 04 ROCm Summary" "${SUMMARY_LINES[@]}"
+CHECK_LINES=()
+[ "$ROCMINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocminfo: OK")")||CHECK_LINES+=("$(bad "rocminfo: FAIL")")
+[ "$CLINFO_OK" = 0 ]&&CHECK_LINES+=("$(ok "clinfo: OK")")||CHECK_LINES+=("$(bad "clinfo: FAIL")")
+[ "$ROCMSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "rocm-smi: OK")")||CHECK_LINES+=("$(bad "rocm-smi: FAIL")")
+[ "$AMDSMI_OK" = 0 ]&&CHECK_LINES+=("$(ok "amd-smi: $AMDSMI_MSG")")||CHECK_LINES+=("$(warn "amd-smi: $AMDSMI_MSG")")
+dkms status 2>/dev/null|grep -qi '^amdgpu/'&&CHECK_LINES+=("$(warn "AMDGPU DKMS installed: YES")")||CHECK_LINES+=("$(ok "AMDGPU DKMS installed: NO")")
+grep -q '^amdgpu ' /proc/modules&&CHECK_LINES+=("$(ok "amdgpu module loaded: YES")")||CHECK_LINES+=("$(bad "amdgpu module loaded: NO")")
+box "Phase 04 ROCm Checks" "${CHECK_LINES[@]}"
+rm -f /tmp/rocminfo-check.log /tmp/clinfo-check.log /tmp/rocm-smi-check.log /tmp/amd-smi-check.log
+)
+mapfile -t PHASE04_PATH_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+if grep -qxF 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' ~/.bashrc;then
+  ok "PATH redundancy in ~/.bashrc: present"
+else
+  bad "PATH redundancy in ~/.bashrc: missing"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "Current PATH includes ~/.local/bin" ;;
+  *) warn "Current PATH does not include ~/.local/bin" ;;
+esac
+)
+box "Phase 04 PATH Checks" "${PHASE04_PATH_LINES[@]}"
+mapfile -t PHASE05_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+pkg_ok 2to3&&ok "Package 2to3: installed"||bad "Package 2to3: missing"
+pkg_ok python-is-python3&&ok "Package python-is-python3: installed"||bad "Package python-is-python3: missing"
+pkg_ok python3-pip&&ok "Package python3-pip: installed"||bad "Package python3-pip: missing"
+pkg_ok python3-venv&&ok "Package python3-venv: installed"||bad "Package python3-venv: missing"
+pkg_ok python3-dev&&ok "Package python3-dev: installed"||bad "Package python3-dev: missing"
+pkg_ok python3-setuptools&&ok "Package python3-setuptools: installed"||bad "Package python3-setuptools: missing"
+python3_ver="$(python3 --version 2>/dev/null||true)"
+python_ver="$(python --version 2>/dev/null||true)"
+pip_ver="$(python3 -m pip --version 2>/dev/null||true)"
+[ -n "$python3_ver" ]&&ok "python3: $python3_ver"||bad "python3: missing"
+[ -n "$python_ver" ]&&ok "python command: $python_ver"||bad "python command: missing"
+[ -n "$pip_ver" ]&&ok "pip: $pip_ver"||bad "pip: missing"
+wheel_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import wheel
+    print(wheel.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$wheel_ver" ]&&ok "wheel import: $wheel_ver"||bad "wheel import: FAIL"
+setuptools_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import setuptools
+    print(setuptools.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$setuptools_ver" ]&&ok "setuptools import: $setuptools_ver"||bad "setuptools import: FAIL"
+numpy_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import numpy
+    print(numpy.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+if [ "$numpy_ver" = "1.26.4" ];then
+  ok "NumPy import: $numpy_ver"
+elif [ -n "$numpy_ver" ];then
+  warn "NumPy import: $numpy_ver"
+  warn "Expected NumPy: 1.26.4"
+else
+  bad "NumPy import: FAIL"
+fi
+if python3 -m venv /tmp/linuxai-venv-check >/tmp/linuxai-venv-check.log 2>&1;then
+  ok "python3 venv creation: OK"
+else
+  bad "python3 venv creation: FAIL"
+  tail -n 2 /tmp/linuxai-venv-check.log 2>/dev/null|sed 's/^/[WARN] /'
+fi
+rm -rf /tmp/linuxai-venv-check /tmp/linuxai-venv-check.log
+)
+box "Phase 05 Python Checks" "${PHASE05_LINES[@]}"
+mapfile -t BAR_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+mapfile -t GPU_BDFS < <(
+  for d in /sys/bus/pci/devices/*;do
+    [ -e "$d" ]||continue
+    [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ]||continue
+    c="$(cat "$d/class" 2>/dev/null||true)"
+    case "$c" in 0x030000|0x038000) basename "$d";; esac
+  done|sort
+)
+find_rebar_cap_offset(){
+  local bdf="$1" off hdr cap_id next
+  off=$((0x100))
+  while [ "$off" -ne 0 ];do
+    hdr="$(sudo setpci -s "$bdf" "$(printf "%x.l" "$off")" 2>/dev/null||true)"
+    [ -n "$hdr" ]||return 1
+    case "$hdr" in
+      ffffffff|FFFFFFFF|00000000) return 1 ;;
+      *[!0-9a-fA-F]*) return 1 ;;
+    esac
+    cap_id=$((16#$hdr & 0xffff))
+    if [ "$cap_id" -eq $((0x0015)) ];then
+      echo "$off"
+      return 0
+    fi
+    next=$(((16#$hdr >> 20) & 0xfff))
+    [ "$next" -ne "$off" ]||return 1
+    off="$next"
+  done
+  return 1
+}
+BIND_BAD=0;BAD_BAR=0;GPU_N=0
+if [ "${#GPU_BDFS[@]}" -eq 0 ];then
+  echo "---- Final Diagnosis ----"
+  bad "Detected GPUs: 0"
+  skip "Wrong BAR0 GPUs: 0"
+  skip "Not bound to amdgpu: 0"
+  skip "BAR0 Check: SKIPPED"
+  skip "amdgpu Binding Check: SKIPPED"
+  bad "Result: No AMD display GPUs detected"
+  echo
+  echo "---- Comments ----"
+  warn "Check PCIe enumeration, power,"
+  warn "slot topology, and bridge state."
+else
+  for bdf in "${GPU_BDFS[@]}";do
+    echo "---- GPU $GPU_N: $bdf ----"
+    GPU_N=$((GPU_N+1))
+    pci="$(lspci -vv -s "$bdf" 2>/dev/null||true)"
+    bar0="$(printf "%s\n" "$pci"|grep -m1 "Region 0:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    bar2="$(printf "%s\n" "$pci"|grep -m1 "Region 2:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    [ -n "$bar0" ]||bar0="not-found"
+    [ -n "$bar2" ]||bar2="not-found"
+    if [ -L "/sys/bus/pci/devices/$bdf/driver" ];then
+      drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+    else
+      drv="none"
+    fi
+    cap_off="$(find_rebar_cap_offset "$bdf"||true)"
+    if [ -n "$cap_off" ];then
+      ctrl_off=$((cap_off + 8))
+      ctrl="$(sudo setpci -s "$bdf" "$(printf "%x.l" "$ctrl_off")" 2>/dev/null||true)"
+      if [ -n "$ctrl" ];then
+        idx=$(((16#$ctrl>>8)&0x3f))
+      else
+        idx="not-available"
+      fi
+    else
+      ctrl_off=""
+      ctrl=""
+      idx="not-available"
+    fi
+    bar_ok=0
+    [ "$bar0" = "32G" ]&&bar_ok=1
+    [ "$idx" = 15 ]&&bar_ok=1
+    [ "$bar0" = "32G" ]&&ok "BAR0: $bar0"||bad "BAR0: $bar0"
+    [ "$bar2" != "not-found" ]&&ok "BAR2: $bar2"||warn "BAR2: $bar2"
+    [ "$drv" = "amdgpu" ]&&ok "Driver: $drv"||bad "Driver: $drv"
+    if [ -n "$cap_off" ];then
+      info "ReBAR Capability Offset: 0x$(printf "%x" "$cap_off")"
+      info "ReBAR Control Offset: 0x$(printf "%x" "$ctrl_off")"
+    else
+      skip "ReBAR Capability Offset: not found"
+    fi
+    [ "$idx" = 15 ]&&ok "BAR0 Size Index: $idx"||bad "BAR0 Size Index: $idx"
+    if [ "$bar_ok" = 1 ];then
+      ok "BAR0 / ReBAR status: OK"
+    else
+      BAD_BAR=$((BAD_BAR+1))
+      bad "BAR0 / ReBAR status: BAD"
+    fi
+    [ "$drv" = "amdgpu" ]||BIND_BAD=$((BIND_BAD+1))
+    echo
+  done
+  if [ "$BAD_BAR" -eq 0 ];then BAR_CHECK="OK";else BAR_CHECK="BAD";fi
+  if [ "$BIND_BAD" -eq 0 ];then BIND_CHECK="OK";else BIND_CHECK="BAD";fi
+  echo "---- Final Diagnosis ----"
+  ok "Detected GPUs: ${#GPU_BDFS[@]}"
+  if [ "$BAD_BAR" -eq 0 ];then
+    ok "Wrong BAR0 GPUs: $BAD_BAR"
+    ok "BAR0 Check: $BAR_CHECK"
+  else
+    bad "Wrong BAR0 GPUs: $BAD_BAR"
+    bad "BAR0 Check: $BAR_CHECK"
+  fi
+  if [ "$BIND_BAD" -eq 0 ];then
+    ok "Not bound to amdgpu: $BIND_BAD"
+    ok "amdgpu Binding Check: $BIND_CHECK"
+  else
+    bad "Not bound to amdgpu: $BIND_BAD"
+    bad "amdgpu Binding Check: $BIND_CHECK"
+  fi
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "Result: BAR0 / ReBAR OK, and GPUs Initialized Correctly"
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "Result: BAR0 / ReBAR Failed"
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    bad "Result: BAR0 / ReBAR OK, but amdgpu Binding Failed"
+  else
+    bad "Result: GPUs Failed to Initialize Correctly"
+  fi
+  echo
+  echo "---- Comments ----"
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "BAR0 / ReBAR OK."
+    ok "GPUs Initialized Correctly."
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "BAR0 / ReBAR Failed."
+    warn "Consider nbritton's method."
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    ok "BAR0 / ReBAR OK."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  else
+    bad "GPUs Failed to Initialize Correctly."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  fi
+fi
+)
+box "GPU BAR0 / ReBAR Diagnosis" "${BAR_LINES[@]}"
+mapfile -t ROCM_REPO_LINES < <(
+POLICY="$(apt-cache policy 2>/dev/null||true)"
+if printf "%s\n" "$POLICY"|grep -q 'repo\.radeon\.com/rocm/apt/7\.2\.3';then
+  ok "ROCm 7.2.3 repo: FOUND"
+  printf "%s\n" "$POLICY"|awk '/repo\.radeon\.com\/rocm\/apt\/7\.2\.3/{print "[INFO] Priority: "$1; print "[INFO] Source: "$2; exit}'
+else
+  bad "ROCm 7.2.3 repo: MISSING"
+  info "Expected repo: repo.radeon.com/rocm/apt/7.2.3"
+  info "Expected priority: 700"
+fi
+)
+box "ROCm APT Repository" "${ROCM_REPO_LINES[@]}"
+mapfile -t TORCH_LINES < <(python3 - <<'PY' 2>/dev/null
+try:
+    import torch
+    cuda = torch.cuda.is_available()
+    n = torch.cuda.device_count()
+    print("[OK]   PyTorch import: OK")
+    print(f"[INFO] PyTorch version: {torch.__version__}")
+    print(f"[INFO] torch.version.hip: {torch.version.hip}")
+    print(f"[INFO] torch.cuda.is_available: {cuda}")
+    print(f"[INFO] GPU count: {n}")
+    if cuda and n > 0:
+        print("[OK]   PyTorch CUDA check: OK")
+        for i in range(n):
+            print(f"[INFO] GPU[{i}]: {torch.cuda.get_device_name(i)}")
+    else:
+        print("[BAD]  PyTorch CUDA check: FAIL")
+except Exception as e:
+    print("[BAD]  PyTorch import: FAIL")
+    print(f"[INFO] Reason: {type(e).__name__}: {e}")
+PY
+)
+box "PyTorch / CUDA" "${TORCH_LINES[@]}"
+if MIGRAPHX_OUT="$(/opt/rocm-7.2.3/bin/migraphx-driver perf --test 2>&1)";then
+  box "MIGraphX Driver" "$(ok "migraphx-driver perf --test: OK")"
+else
+  mapfile -t MIGRAPHX_ERR < <(printf "%s\n" "$MIGRAPHX_OUT"|tail -n 6|sed 's/^/[INFO] /')
+  box "MIGraphX Driver" "$(bad "migraphx-driver perf --test: FAIL")" "${MIGRAPHX_ERR[@]}"
+fi
+mapfile -t MIGRAPHX_PKG_LINES < <(dpkg-query -W -f='${binary:Package} ${Version}\n' '*migraphx*' '*half*' 2>/dev/null|sort -u|sed 's/^/[OK]   installed: /')
+if ((${#MIGRAPHX_PKG_LINES[@]} == 0));then
+  MIGRAPHX_PKG_LINES=("$(bad "MIGraphX / half packages: NOT FOUND")")
+fi
+box "MIGraphX Packages" "${MIGRAPHX_PKG_LINES[@]}"
+mapfile -t ORT_LINES < <(python3 - <<'PY' 2>/dev/null
+try:
+    import onnxruntime as ort
+    providers = ort.get_available_providers()
+    has_migraphx = "MIGraphXExecutionProvider" in providers
+    print("[OK]   ONNX Runtime import: OK")
+    print(f"[INFO] ONNX Runtime version: {ort.__version__}")
+    print("[OK]   MIGraphXExecutionProvider: PRESENT" if has_migraphx else "[BAD]  MIGraphXExecutionProvider: ABSENT")
+    print("[INFO] Providers: " + ", ".join(providers))
+except Exception as e:
+    print("[BAD]  ONNX Runtime check: FAIL")
+    print(f"[INFO] Reason: {type(e).__name__}: {e}")
+PY
+)
+box "ONNX Runtime" "${ORT_LINES[@]}"
+mapfile -t TF_LINES < <(TF_CPP_MIN_LOG_LEVEL=3 python3 - <<'PY' 2>/dev/null
+try:
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices("GPU")
+    print("[OK]   TensorFlow import: OK")
+    print(f"[INFO] TensorFlow version: {tf.__version__}")
+    print(f"[INFO] TensorFlow GPU count: {len(gpus)}")
+    if not gpus:
+        print("[BAD]  TensorFlow GPU check: FAIL")
+        print("[INFO] TensorFlow GPUs: NONE")
+    else:
+        print("[OK]   TensorFlow GPU check: OK")
+        for i, g in enumerate(gpus):
+            print(f"[INFO] GPU[{i}]: {g.name}")
+        tf.config.set_soft_device_placement(False)
+        with tf.device("/GPU:0"):
+            a = tf.random.normal((2048, 2048))
+            b = tf.random.normal((2048, 2048))
+            c = tf.matmul(a, b)
+            _ = c.numpy()
+        print("[OK]   TensorFlow GPU matmul: OK")
+except Exception as e:
+    print("[BAD]  TensorFlow check: FAIL")
+    print(f"[INFO] Reason: {type(e).__name__}: {e}")
+PY
+)
+box "TensorFlow GPU" "${TF_LINES[@]}"
+mapfile -t APEX_LINES < <(python3 - <<'PY'
+import os
+import sys
+import tempfile
+import traceback
+results = []
+log_path = None
+old_stdout = os.dup(1)
+old_stderr = os.dup(2)
+log = tempfile.NamedTemporaryFile(mode="w+", delete=False)
+log_path = log.name
+try:
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+    try:
+        import torch
+        from apex.optimizers import FusedAdam
+        results.append("[OK]   Apex FusedAdam import: OK")
+        if not torch.cuda.is_available():
+            results.append("[BAD]  Apex GPU optimizer check: FAIL")
+            results.append("[INFO] Reason: torch.cuda.is_available() is False")
+        else:
+            device = torch.device("cuda:0")
+            model = torch.nn.Linear(8, 4).to(device)
+            optimizer = FusedAdam(model.parameters(), lr=0.001)
+            x = torch.randn(16, 8, device=device)
+            target = torch.randn(16, 4, device=device)
+            optimizer.zero_grad()
+            output = model(x)
+            loss = torch.nn.functional.mse_loss(output, target)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            torch.cuda.synchronize(device)
+            results.append("[OK]   Apex FusedAdam GPU step: OK")
+            results.append(f"[INFO] Loss: {float(loss.detach().cpu()):.6f}")
+            results.append(f"[INFO] Device: {torch.cuda.get_device_name(0)}")
+    except Exception as e:
+        results.append("[BAD]  Apex FusedAdam check: FAIL")
+        results.append(f"[INFO] Reason: {type(e).__name__}: {e}")
+        traceback.print_exc()
+finally:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(old_stdout, 1)
+    os.dup2(old_stderr, 2)
+    os.close(old_stdout)
+    os.close(old_stderr)
+    log.close()
+failed = any("[BAD]" in line for line in results)
+if failed and log_path:
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            noisy_lines = [line.rstrip() for line in f if line.strip()]
+        tail = noisy_lines[-6:]
+        if tail:
+            results.append("[INFO] Apex suppressed log tail:")
+            for line in tail:
+                if len(line) > 140:
+                    line = line[:137] + "..."
+                results.append("[INFO] " + line)
+    except Exception as e:
+        results.append(f"[INFO] Unable to read Apex suppressed log: {type(e).__name__}: {e}")
+try:
+    if log_path:
+        os.unlink(log_path)
+except Exception:
+    pass
+for line in results:
+    print(line)
+PY
+)
+box "Apex FusedAdam" "${APEX_LINES[@]}"
