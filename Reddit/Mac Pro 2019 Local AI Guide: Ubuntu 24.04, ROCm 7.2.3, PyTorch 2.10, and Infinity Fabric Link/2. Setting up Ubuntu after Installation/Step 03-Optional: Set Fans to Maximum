@@ -1,0 +1,59 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+sudo bash -c 'cfg=/etc/t2fand.conf; tmp=$(mktemp); countfile=$(mktemp); awk '"'"'function flush_missing(){if(in_fan && !saw_afs){print "always_full_speed=true"; changed++} saw_afs=0} BEGIN{in_fan=0;saw_afs=0;changed=0;total_fans=0} /^\[Fan[0-9]+\][[:space:]]*$/{flush_missing(); in_fan=1; total_fans++; print; next} /^\[[^]]+\][[:space:]]*$/{flush_missing(); in_fan=0; print; next} /^[[:space:]]*always_full_speed[[:space:]]*=/{saw_afs=1; line=$0; val=line; sub(/^[^=]*=/,"",val); gsub(/[[:space:]]/,"",val); if(tolower(val)!="true"){sub(/=.*/,"=true",line); changed++} print line; next} {print} END{flush_missing(); printf "%d %d\n", changed, total_fans > "/dev/stderr"}'"'"' "$cfg" > "$tmp" 2> "$countfile"; read changed total < "$countfile"; mv "$tmp" "$cfg"; rm -f "$countfile"; echo "Fans changed to always_full_speed=true: $changed (Fan sections detected: $total)";'
+sudo systemctl restart t2fanrd
+mapfile -t PHASE03_FAN_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cfg="/etc/t2fand.conf"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+if sudo test -f "$cfg";then
+  ok "t2fand config: present"
+else
+  bad "t2fand config: missing"
+fi
+read fan_total full_speed_true full_speed_missing < <(
+  sudo awk '
+  function flush(){if(in_fan && !saw_afs) missing++; saw_afs=0}
+  BEGIN{in_fan=0;saw_afs=0;total=0;true_count=0;missing=0}
+  /^\[Fan[0-9]+\][[:space:]]*$/{flush();in_fan=1;total++;next}
+  /^\[[^]]+\][[:space:]]*$/{flush();in_fan=0;next}
+  in_fan && /^[[:space:]]*always_full_speed[[:space:]]*=/{
+    saw_afs=1
+    val=$0
+    sub(/^[^=]*=/,"",val)
+    gsub(/[[:space:]]/,"",val)
+    if(tolower(val)=="true") true_count++
+    next
+  }
+  END{flush();print total,true_count,missing}
+  ' "$cfg" 2>/dev/null || echo "0 0 0"
+)
+if [ "$fan_total" -gt 0 ] 2>/dev/null;then
+  ok "Fan sections detected: $fan_total"
+else
+  bad "Fan sections detected: 0"
+fi
+if [ "$fan_total" -gt 0 ] 2>/dev/null&&[ "$full_speed_true" -eq "$fan_total" ] 2>/dev/null&&[ "$full_speed_missing" -eq 0 ] 2>/dev/null;then
+  ok "always_full_speed=true: all fan sections"
+else
+  bad "always_full_speed=true: incomplete"
+  warn "Fan sections with full speed: ${full_speed_true:-0}/${fan_total:-0}"
+  warn "Fan sections missing setting: ${full_speed_missing:-0}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+info "Fans set to full speed."
+)
+box "Phase 03 Fan Checks" "${PHASE03_FAN_LINES[@]}"
