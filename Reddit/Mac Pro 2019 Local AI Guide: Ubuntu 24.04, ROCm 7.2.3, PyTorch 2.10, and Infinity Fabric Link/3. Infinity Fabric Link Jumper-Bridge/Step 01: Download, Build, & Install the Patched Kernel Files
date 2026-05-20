@@ -1,5 +1,3 @@
-# IFLB - Ubuntu Kernel Patch for Sienna Cichlid xGMI Support
-
 bash <<'IFLB_SCRIPT'
     set -Eeuo pipefail
     SOURCE_PKG="linux-hwe-6.17"
