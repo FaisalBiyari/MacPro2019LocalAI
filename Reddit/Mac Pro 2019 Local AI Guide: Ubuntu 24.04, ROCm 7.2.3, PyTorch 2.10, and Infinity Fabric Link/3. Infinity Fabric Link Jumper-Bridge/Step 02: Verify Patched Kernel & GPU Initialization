@@ -1,5 +1,3 @@
-# IFLB Final Post-Reboot Verification
-
 banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
 box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
 ok(){ echo "[OK]   $*"; }
