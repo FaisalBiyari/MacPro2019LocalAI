@@ -1,0 +1,74 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 05: Install Python Tools"
+sudo apt install 2to3 python-is-python3 python3-pip python3-venv python3-dev python3-setuptools -y
+APT_PYTHON_TOOLS_OK=$?
+python3 -m pip install --upgrade pip wheel setuptools --break-system-packages
+PIP_TOOLS_OK=$?
+python3 -m pip install "numpy==1.26.4" --break-system-packages
+NUMPY_INSTALL_OK=$?
+mapfile -t PHASE05_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+[ "$APT_PYTHON_TOOLS_OK" = 0 ]&&ok "APT Python tools install: OK"||bad "APT Python tools install: FAIL"
+[ "$PIP_TOOLS_OK" = 0 ]&&ok "pip / wheel / setuptools upgrade: OK"||bad "pip / wheel / setuptools upgrade: FAIL"
+[ "$NUMPY_INSTALL_OK" = 0 ]&&ok "NumPy install: OK"||bad "NumPy install: FAIL"
+pkg_ok 2to3&&ok "Package 2to3: installed"||bad "Package 2to3: missing"
+pkg_ok python-is-python3&&ok "Package python-is-python3: installed"||bad "Package python-is-python3: missing"
+pkg_ok python3-pip&&ok "Package python3-pip: installed"||bad "Package python3-pip: missing"
+pkg_ok python3-venv&&ok "Package python3-venv: installed"||bad "Package python3-venv: missing"
+pkg_ok python3-dev&&ok "Package python3-dev: installed"||bad "Package python3-dev: missing"
+pkg_ok python3-setuptools&&ok "Package python3-setuptools: installed"||bad "Package python3-setuptools: missing"
+python3_ver="$(python3 --version 2>/dev/null||true)"
+python_ver="$(python --version 2>/dev/null||true)"
+pip_ver="$(python3 -m pip --version 2>/dev/null||true)"
+[ -n "$python3_ver" ]&&ok "python3: $python3_ver"||bad "python3: missing"
+[ -n "$python_ver" ]&&ok "python command: $python_ver"||bad "python command: missing"
+[ -n "$pip_ver" ]&&ok "pip: $pip_ver"||bad "pip: missing"
+wheel_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import wheel
+    print(wheel.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$wheel_ver" ]&&ok "wheel import: $wheel_ver"||bad "wheel import: FAIL"
+setuptools_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import setuptools
+    print(setuptools.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+[ -n "$setuptools_ver" ]&&ok "setuptools import: $setuptools_ver"||bad "setuptools import: FAIL"
+numpy_ver="$(python3 - <<'PY' 2>/dev/null
+try:
+    import numpy
+    print(numpy.__version__)
+except Exception:
+    raise SystemExit(1)
+PY
+)"
+if [ "$numpy_ver" = "1.26.4" ];then
+  ok "NumPy import: $numpy_ver"
+elif [ -n "$numpy_ver" ];then
+  warn "NumPy import: $numpy_ver"
+  warn "Expected NumPy: 1.26.4"
+else
+  bad "NumPy import: FAIL"
+fi
+if python3 -m venv /tmp/linuxai-venv-check >/tmp/linuxai-venv-check.log 2>&1;then
+  ok "python3 venv creation: OK"
+else
+  bad "python3 venv creation: FAIL"
+  tail -n 2 /tmp/linuxai-venv-check.log 2>/dev/null|sed 's/^/[WARN] /'
+fi
+rm -rf /tmp/linuxai-venv-check /tmp/linuxai-venv-check.log
+info "Python tool setup complete."
+)
+box "Phase 05 Checks" "${PHASE05_LINES[@]}"
