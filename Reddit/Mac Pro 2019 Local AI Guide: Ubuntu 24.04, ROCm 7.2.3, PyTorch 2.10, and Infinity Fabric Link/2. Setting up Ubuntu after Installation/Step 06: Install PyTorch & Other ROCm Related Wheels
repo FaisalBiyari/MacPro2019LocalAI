@@ -1,0 +1,129 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 06: Install PyTorch & Other ROCm Related Wheels"
+mkdir -p ~/SetupFiles/rocm-7.2.3/wheels
+PHASE06_MKDIR_OK=$?
+cd ~/SetupFiles/rocm-7.2.3/wheels
+PHASE06_CD_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torch-2.10.0%2Brocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCH_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torchvision-0.25.0%2Brocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCHVISION_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/torchaudio-2.10.0%2Brocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TORCHAUDIO_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/triton-3.6.0%2Brocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_TRITON_OK=$?
+python3 -m pip uninstall torch torchvision triton torchaudio -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./torch-2.10.0+rocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl \
+./torchvision-0.25.0+rocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl \
+./torchaudio-2.10.0+rocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl \
+./triton-3.6.0+rocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl
+PHASE06_PIP_TORCH_STACK_OK=$?
+sudo mkdir -p /etc/apt/keyrings
+PHASE06_KEYRINGS_OK=$?
+curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+PHASE06_ROCM_KEY_OK=0
+for s in "${PIPESTATUS[@]}";do [ "$s" = 0 ]||PHASE06_ROCM_KEY_OK=1;done
+sudo chmod 644 /etc/apt/keyrings/rocm.gpg
+PHASE06_KEY_CHMOD_OK=$?
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.3 noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
+PHASE06_ROCM_LIST_OK=0
+for s in "${PIPESTATUS[@]}";do [ "$s" = 0 ]||PHASE06_ROCM_LIST_OK=1;done
+sudo tee /etc/apt/preferences.d/rocm-radeon-priority >/dev/null <<'EOF2'
+Package: *
+Pin: origin repo.radeon.com
+Pin-Priority: 700
+EOF2
+PHASE06_ROCM_PREF_OK=$?
+sudo apt update
+PHASE06_APT_UPDATE_OK=$?
+sudo rm -f \
+/opt/rocm-7.2.3/bin/amdclang \
+/opt/rocm-7.2.3/bin/amdclang++ \
+/opt/rocm-7.2.3/bin/amdclang-cl \
+/opt/rocm-7.2.3/bin/amdclang-cpp \
+/opt/rocm-7.2.3/bin/amdflang \
+/opt/rocm-7.2.3/bin/amdlld \
+/opt/rocm-7.2.3/bin/offload-arch
+PHASE06_REMOVE_CONFLICTS_OK=$?
+sudo apt install migraphx half -y
+PHASE06_APT_MIGRAPHX_HALF_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+PHASE06_WGET_ORT_OK=$?
+python3 -m pip uninstall onnxruntime onnxruntime-migraphx -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+PHASE06_PIP_ORT_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/tensorflow_rocm-2.20.0.dev0%2Bselfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl
+PHASE06_WGET_TF_OK=$?
+python3 -m pip uninstall tensorflow tensorflow-rocm tf-nightly-rocm -y --break-system-packages || true
+python3 -m pip install tf-keras --no-deps --break-system-packages
+PHASE06_PIP_TFKERAS_OK=$?
+python3 -m pip install --upgrade --break-system-packages \
+./tensorflow_rocm-2.20.0.dev0+selfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl
+PHASE06_PIP_TF_OK=$?
+wget -nc https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/apex-1.10.0%2Brocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl
+PHASE06_WGET_APEX_OK=$?
+python3 -m pip uninstall apex -y --break-system-packages || true
+python3 -m pip install --upgrade --break-system-packages \
+./apex-1.10.0+rocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl
+PHASE06_PIP_APEX_OK=$?
+mapfile -t PHASE06_INSTALL_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+pip_ok(){ python3 -m pip show "$1" >/dev/null 2>&1; }
+file_ok(){ [ -f "$1" ]&&ok "$2: present"||bad "$2: missing"; }
+[ "$PHASE06_MKDIR_OK" = 0 ]&&ok "Wheels directory created"||bad "Wheels directory creation failed"
+[ "$PHASE06_CD_OK" = 0 ]&&ok "Entered wheels directory"||bad "Failed to enter wheels directory"
+[ "$PHASE06_WGET_TORCH_OK" = 0 ]&&ok "torch wheel download: OK"||bad "torch wheel download: FAIL"
+[ "$PHASE06_WGET_TORCHVISION_OK" = 0 ]&&ok "torchvision wheel download: OK"||bad "torchvision wheel download: FAIL"
+[ "$PHASE06_WGET_TORCHAUDIO_OK" = 0 ]&&ok "torchaudio wheel download: OK"||bad "torchaudio wheel download: FAIL"
+[ "$PHASE06_WGET_TRITON_OK" = 0 ]&&ok "triton wheel download: OK"||bad "triton wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torch-2.10.0+rocm7.2.3.lw.git1a270074-cp312-cp312-linux_x86_64.whl" "torch wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torchvision-0.25.0+rocm7.2.3.git82df5f59-cp312-cp312-linux_x86_64.whl" "torchvision wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/torchaudio-2.10.0+rocm7.2.3.git5047768f-cp312-cp312-linux_x86_64.whl" "torchaudio wheel file"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/triton-3.6.0+rocm7.2.3.git4ed88892-cp312-cp312-linux_x86_64.whl" "triton wheel file"
+[ "$PHASE06_PIP_TORCH_STACK_OK" = 0 ]&&ok "PyTorch stack install: OK"||bad "PyTorch stack install: FAIL"
+[ "$PHASE06_KEYRINGS_OK" = 0 ]&&ok "APT keyrings directory: OK"||bad "APT keyrings directory: FAIL"
+[ "$PHASE06_ROCM_KEY_OK" = 0 ]&&ok "ROCm APT key install: OK"||bad "ROCm APT key install: FAIL"
+[ "$PHASE06_KEY_CHMOD_OK" = 0 ]&&ok "ROCm APT key permissions: OK"||bad "ROCm APT key permissions: FAIL"
+[ "$PHASE06_ROCM_LIST_OK" = 0 ]&&ok "ROCm APT source list write: OK"||bad "ROCm APT source list write: FAIL"
+[ "$PHASE06_ROCM_PREF_OK" = 0 ]&&ok "ROCm APT priority write: OK"||bad "ROCm APT priority write: FAIL"
+[ "$PHASE06_APT_UPDATE_OK" = 0 ]&&ok "APT update after ROCm repo: OK"||bad "APT update after ROCm repo: FAIL"
+[ "$PHASE06_REMOVE_CONFLICTS_OK" = 0 ]&&ok "ROCm LLVM conflict cleanup: OK"||bad "ROCm LLVM conflict cleanup: FAIL"
+[ "$PHASE06_APT_MIGRAPHX_HALF_OK" = 0 ]&&ok "MIGraphX / half install: OK"||bad "MIGraphX / half install: FAIL"
+pkg_ok migraphx&&ok "Package migraphx: installed"||bad "Package migraphx: missing"
+pkg_ok half&&ok "Package half: installed"||bad "Package half: missing"
+[ "$PHASE06_WGET_ORT_OK" = 0 ]&&ok "ONNX Runtime MIGraphX wheel download: OK"||bad "ONNX Runtime MIGraphX wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" "ONNX Runtime MIGraphX wheel file"
+[ "$PHASE06_PIP_ORT_OK" = 0 ]&&ok "ONNX Runtime MIGraphX install: OK"||bad "ONNX Runtime MIGraphX install: FAIL"
+[ "$PHASE06_WGET_TF_OK" = 0 ]&&ok "TensorFlow ROCm wheel download: OK"||bad "TensorFlow ROCm wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/tensorflow_rocm-2.20.0.dev0+selfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl" "TensorFlow ROCm wheel file"
+[ "$PHASE06_PIP_TFKERAS_OK" = 0 ]&&ok "tf-keras install: OK"||bad "tf-keras install: FAIL"
+[ "$PHASE06_PIP_TF_OK" = 0 ]&&ok "TensorFlow ROCm install: OK"||bad "TensorFlow ROCm install: FAIL"
+[ "$PHASE06_WGET_APEX_OK" = 0 ]&&ok "Apex wheel download: OK"||bad "Apex wheel download: FAIL"
+file_ok "$HOME/SetupFiles/rocm-7.2.3/wheels/apex-1.10.0+rocm7.2.3.git751f5dd5-cp312-cp312-linux_x86_64.whl" "Apex wheel file"
+[ "$PHASE06_PIP_APEX_OK" = 0 ]&&ok "Apex install: OK"||bad "Apex install: FAIL"
+pip_ok torch&&ok "pip package torch: installed"||bad "pip package torch: missing"
+pip_ok torchvision&&ok "pip package torchvision: installed"||bad "pip package torchvision: missing"
+pip_ok torchaudio&&ok "pip package torchaudio: installed"||bad "pip package torchaudio: missing"
+pip_ok triton&&ok "pip package triton: installed"||bad "pip package triton: missing"
+pip_ok onnxruntime-migraphx&&ok "pip package onnxruntime-migraphx: installed"||bad "pip package onnxruntime-migraphx: missing"
+pip_ok tensorflow-rocm&&ok "pip package tensorflow-rocm: installed"||bad "pip package tensorflow-rocm: missing"
+pip_ok tf-keras&&ok "pip package tf-keras: installed"||bad "pip package tf-keras: missing"
+pip_ok apex&&ok "pip package apex: installed"||bad "pip package apex: missing"
+info "Step 06 install checks complete."
+)
+box "Phase 06 Install Checks" "${PHASE06_INSTALL_LINES[@]}"
+if printf "%s\n" "${PHASE06_INSTALL_LINES[@]}"|grep -q '^\[BAD\]';then
+  box "Error" "One or more install checks failed." "Do not reboot yet." "Review the output above."
+  exit 1
+fi
+sudo apt autoremove -y
+banner "Installation Complete"
+box "Important" "The system will reboot now." "After reboot, the installation is complete."
+sudo reboot
