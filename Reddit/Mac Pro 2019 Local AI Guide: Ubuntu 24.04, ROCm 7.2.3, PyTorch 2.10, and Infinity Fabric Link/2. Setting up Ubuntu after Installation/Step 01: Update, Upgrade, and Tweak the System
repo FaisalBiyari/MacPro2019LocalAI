@@ -1,0 +1,94 @@
+# Setup / Install / Configure ROCm 7.2.3 for Ubuntu 24.04 T2 Linux AMD GPUs
+
+# Phase 01
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 01: Update, Upgrade, and Tweak the System"
+sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+sudo pro attach
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install linux-generic-hwe-24.04 -y
+sudo apt purge cloud-init -y
+sudo rm -rf /etc/cloud/ /var/lib/cloud/
+sudo apt autoremove -y
+sudo systemctl disable systemd-networkd-wait-online.service
+sudo systemctl mask systemd-networkd-wait-online.service
+sudo netplan generate
+sudo rm -r /etc/netplan/*.yaml
+sudo tee /etc/netplan/01-netplan-default.yaml >/dev/null <<'NETPLAN_EOF'
+network:
+  version: 2
+  ethernets:
+    all-interfaces:
+      match:
+        name: "*"
+      dhcp4: true
+      optional: true
+NETPLAN_EOF
+sudo chown root:root /etc/netplan/*.yaml
+sudo chmod 600 /etc/netplan/*.yaml
+sudo netplan apply
+sudo bash -c 'GRUB_LINE='\''GRUB_CMDLINE_LINUX_DEFAULT="loglevel=7 log_buf_len=16M iommu=pt"'\''; \
+(grep -Eq "^[[:space:]]*#?[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub && \
+sed -i -E "s|^[[:space:]]*#?[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=.*|$GRUB_LINE|" /etc/default/grub || \
+printf "\n%s\n" "$GRUB_LINE" >> /etc/default/grub) && \
+update-grub && \
+grep -nE "^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub'
+mapfile -t PHASE01_LINES < <(
+ok(){ echo "[OK]   $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+cur_kernel="$(uname -r 2>/dev/null||echo unknown)"
+next_kernel="$(basename "$(readlink -f /boot/vmlinuz 2>/dev/null||true)"|sed 's/^vmlinuz-//')"
+grub_line="$(grep -E '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null||true)"
+netplan_files="$(find /etc/netplan -maxdepth 1 -name '*.yaml' 2>/dev/null|wc -l)"
+dhcp4="$(sudo netplan get ethernets.all-interfaces.dhcp4 2>/dev/null||true)"
+pro_attached="$(pro status 2>/dev/null|grep -q "Subscription:"&&echo yes||echo no)"
+wait_enabled="$(systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null||true)"
+wait_active="$(systemctl is-active systemd-networkd-wait-online.service 2>/dev/null||true)"
+info "Current kernel: $cur_kernel"
+if [ -n "$next_kernel" ];then
+  if [ "$cur_kernel" = "$next_kernel" ];then
+    ok "Booted kernel matches next boot kernel: $cur_kernel"
+  else
+    warn "Current kernel: $cur_kernel"
+    warn "Next boot kernel: $next_kernel"
+  fi
+else
+  warn "Next boot kernel: not detected"
+fi
+if [[ "$grub_line" == *"loglevel=7"* && "$grub_line" == *"log_buf_len=16M"* && "$grub_line" == *"iommu=pt"* ]];then
+  ok "GRUB flags: loglevel=7 log_buf_len=16M iommu=pt"
+else
+  warn "GRUB flags: check /etc/default/grub"
+fi
+if [ "$netplan_files" -gt 0 ];then
+  ok "Netplan YAML files: $netplan_files"
+else
+  warn "Netplan YAML files: missing"
+fi
+if [ "$dhcp4" = "true" ];then
+  ok "Netplan DHCPv4 all-interfaces: true"
+else
+  warn "Netplan DHCPv4 all-interfaces: check needed"
+fi
+if [ "$pro_attached" = "yes" ];then
+  ok "Ubuntu Pro: attached"
+else
+  warn "Ubuntu Pro: not attached"
+fi
+if [ "$wait_enabled" = "masked" ];then
+  ok "networkd-wait-online: masked"
+else
+  warn "networkd-wait-online enabled state: ${wait_enabled:-unknown}"
+fi
+if [ "$wait_active" != "active" ];then
+  ok "networkd-wait-online: not active"
+else
+  warn "networkd-wait-online: active"
+fi
+)
+box "Phase 01 Checks" "${PHASE01_LINES[@]}"
+box "Important" "The system will reboot now" "After reboot, continue with the next section"
+sudo reboot
