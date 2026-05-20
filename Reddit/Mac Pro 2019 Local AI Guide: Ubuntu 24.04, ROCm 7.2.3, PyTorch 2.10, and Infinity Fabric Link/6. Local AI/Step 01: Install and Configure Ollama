@@ -1,0 +1,393 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 01: Install Ollama"
+curl -fsSL https://ollama.com/install.sh | sh
+OLLAMA_INSTALL_OK=$?
+mapfile -t PHASE01_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+if [ "$OLLAMA_INSTALL_OK" = 0 ];then
+  ok "Ollama installer: OK"
+else
+  bad "Ollama installer: FAIL"
+fi
+if command -v ollama >/dev/null 2>&1;then
+  ok "ollama command: present"
+  ver="$(ollama --version 2>/dev/null||true)"
+  [ -n "$ver" ]&&info "$ver"||warn "ollama version: not reported"
+else
+  bad "ollama command: missing"
+fi
+if systemctl cat ollama >/dev/null 2>&1;then
+  ok "ollama service file: present"
+else
+  bad "ollama service file: missing"
+fi
+enabled="$(systemctl is-enabled ollama 2>/dev/null||true)"
+active="$(systemctl is-active ollama 2>/dev/null||true)"
+failed="$(systemctl is-failed ollama 2>/dev/null||true)"
+svc_user="$(systemctl show ollama -p User --value 2>/dev/null||true)"
+[ -n "$svc_user" ]||svc_user="not explicitly set"
+if [ "$enabled" = "enabled" ];then
+  ok "ollama enabled: yes"
+else
+  warn "ollama enabled: ${enabled:-unknown}"
+fi
+if [ "$active" = "active" ];then
+  ok "ollama active: yes"
+else
+  warn "ollama active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "ollama failed state: failed"
+else
+  ok "ollama failed state: clear"
+fi
+info "Service user: $svc_user"
+)
+box "Step 01 Checks" "${PHASE01_LINES[@]}"
+if printf "%s\n" "${PHASE01_LINES[@]}" | grep -q '^\[BAD\]';then
+  box "Error" \
+  "One or more Step 01 checks failed." \
+  "Do not continue yet." \
+  "Review the output above."
+  exit 1
+fi
+banner "Step 02: Unify Ollama Model Library"
+LOCAL_USER="${SUDO_USER:-$USER}"
+[ -n "$LOCAL_USER" ]||LOCAL_USER="$(id -un)"
+SVC_USER="$(systemctl show ollama -p User --value 2>/dev/null||true)"
+[ -n "$SVC_USER" ]||SVC_USER="ollama"
+OLLAMA_GROUP="ollama"
+USER_OLLAMA_DIR="$HOME/.ollama"
+box "Target" \
+"/srv/ollama/models" \
+"Both systemd service and manual ollama serve will use this path." \
+"Only $SVC_USER, $LOCAL_USER, and members of $OLLAMA_GROUP will have write access." \
+"Directories use 2775, not 2777." \
+"Files use 664, not 666." \
+"Service UMask uses 0002, not 0000."
+sudo apt update
+APT_UPDATE_OK=$?
+sudo apt install rsync acl -y
+RSYNC_ACL_OK=$?
+sudo systemctl stop ollama 2>/dev/null || true
+sudo groupadd -f "$OLLAMA_GROUP"
+GROUP_OK=$?
+if id "$SVC_USER" >/dev/null 2>&1;then
+  sudo usermod -aG "$OLLAMA_GROUP" "$SVC_USER"
+  SVC_GROUP_OK=$?
+else
+  SVC_GROUP_OK=1
+fi
+if id "$LOCAL_USER" >/dev/null 2>&1;then
+  sudo usermod -aG "$OLLAMA_GROUP" "$LOCAL_USER"
+  LOCAL_GROUP_OK=$?
+else
+  LOCAL_GROUP_OK=1
+fi
+sudo mkdir -p /srv/ollama/models
+MKDIR_SRV_OK=$?
+sudo mkdir -p /usr/share/ollama/.ollama
+MKDIR_SHARE_OK=$?
+mkdir -p "$USER_OLLAMA_DIR"
+MKDIR_HOME_OK=$?
+sudo mkdir -p /root/.ollama
+MKDIR_ROOT_OK=$?
+box "Copy Existing Models" \
+"Copying from known Ollama model locations." \
+"Existing files in /srv/ollama/models will not be overwritten."
+COPY_COUNT=0
+for p in "/usr/share/ollama/.ollama/models" "$USER_OLLAMA_DIR/models" "/root/.ollama/models";do
+  if sudo test -d "$p";then
+    echo "Copying: $p"
+    sudo rsync -aH --ignore-existing "$p"/ /srv/ollama/models/
+    COPY_COUNT=$((COPY_COUNT+1))
+  fi
+done
+export OLLAMA_MODELS=/srv/ollama/models
+mapfile -t OLLAMA_DATA_DIRS < <(
+  {
+    echo "/srv/ollama"
+    echo "/srv/ollama/models"
+    echo "/usr/share/ollama"
+    echo "/usr/share/ollama/.ollama"
+    echo "$USER_OLLAMA_DIR"
+    echo "/root/.ollama"
+    systemctl show ollama --property=Environment 2>/dev/null \
+      | tr ' ' '\n' \
+      | sed -n 's/^OLLAMA_MODELS=//p'
+    [ -n "${OLLAMA_MODELS:-}" ]&&echo "$OLLAMA_MODELS"
+    sudo find /srv/ollama /usr/share/ollama "$USER_OLLAMA_DIR" /root/.ollama \
+      -maxdepth 5 \
+      -type d \
+      \( -name ".ollama" -o -name "models" -o -name "manifests" -o -name "blobs" \) \
+      2>/dev/null || true
+  } | awk 'NF&&!seen[$0]++'
+)
+DISCOVER_LINES=()
+for d in "${OLLAMA_DATA_DIRS[@]}";do
+  if sudo test -d "$d";then
+    DISCOVER_LINES+=("[OK]   Found: $d")
+  else
+    DISCOVER_LINES+=("[WARN] Missing: $d")
+  fi
+done
+box "Discovered Ollama Data Folders" "${DISCOVER_LINES[@]}"
+box "Safer Shared Permissions" \
+"Shared group: $OLLAMA_GROUP" \
+"Service user: $SVC_USER" \
+"Intended local user: $LOCAL_USER" \
+"Shared directories: 2775" \
+"Shared files: 664" \
+"Private .ollama directories: 2750" \
+"Other users: no write access"
+sudo tee /usr/local/sbin/ollama-permission-repair >/dev/null <<EOF
+#!/usr/bin/env bash
+set +e
+svc_user="$SVC_USER"
+local_user="$LOCAL_USER"
+ollama_group="$OLLAMA_GROUP"
+user_ollama_dir="$USER_OLLAMA_DIR"
+shared_paths=(
+  "/srv/ollama"
+  "/srv/ollama/models"
+  "/usr/share/ollama"
+  "/usr/share/ollama/.ollama"
+)
+private_paths=(
+  "\$user_ollama_dir"
+  "/root/.ollama"
+)
+for d in "\${shared_paths[@]}";do
+  [ -d "\$d" ]||continue
+  chown -R "\$svc_user:\$ollama_group" "\$d" 2>/dev/null || true
+  find "\$d" -type d -exec chmod 2775 {} + 2>/dev/null || true
+  find "\$d" -type f -exec chmod 664 {} + 2>/dev/null || true
+  setfacl -R -b "\$d" 2>/dev/null || true
+  setfacl -R -m "u:\$svc_user:rwX,u:\$local_user:rwX,g:\$ollama_group:rwX,m::rwX,o::rX" "\$d" 2>/dev/null || true
+  setfacl -R -d -m "u:\$svc_user:rwx,u:\$local_user:rwx,g:\$ollama_group:rwx,m::rwx,o::rx" "\$d" 2>/dev/null || true
+done
+if [ -d "\$user_ollama_dir" ];then
+  chown -R "\$local_user:\$ollama_group" "\$user_ollama_dir" 2>/dev/null || true
+  find "\$user_ollama_dir" -type d -exec chmod 2750 {} + 2>/dev/null || true
+  find "\$user_ollama_dir" -type f -exec chmod 640 {} + 2>/dev/null || true
+  setfacl -R -b "\$user_ollama_dir" 2>/dev/null || true
+  setfacl -R -m "u:\$local_user:rwX,g:\$ollama_group:rX,m::rX,o::---" "\$user_ollama_dir" 2>/dev/null || true
+  setfacl -R -d -m "u:\$local_user:rwx,g:\$ollama_group:rx,m::rx,o::---" "\$user_ollama_dir" 2>/dev/null || true
+fi
+if [ -d /root/.ollama ];then
+  chown -R root:"\$ollama_group" /root/.ollama 2>/dev/null || true
+  find /root/.ollama -type d -exec chmod 2750 {} + 2>/dev/null || true
+  find /root/.ollama -type f -exec chmod 640 {} + 2>/dev/null || true
+  setfacl -R -b /root/.ollama 2>/dev/null || true
+  setfacl -R -m "u:root:rwX,g:\$ollama_group:rX,m::rX,o::---" /root/.ollama 2>/dev/null || true
+  setfacl -R -d -m "u:root:rwx,g:\$ollama_group:rx,m::rx,o::---" /root/.ollama 2>/dev/null || true
+fi
+exit 0
+EOF
+sudo chmod 755 /usr/local/sbin/ollama-permission-repair
+REPAIR_SCRIPT_OK=$?
+sudo /usr/local/sbin/ollama-permission-repair
+REPAIR_RUN_OK=$?
+banner "Configure Ollama Service"
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<EOF
+[Service]
+Environment="OLLAMA_MODELS=/srv/ollama/models"
+Group=$OLLAMA_GROUP
+UMask=0002
+ExecStartPre=+/usr/local/sbin/ollama-permission-repair
+ExecStopPost=+/usr/local/sbin/ollama-permission-repair
+EOF
+OVERRIDE_OK=$?
+sudo systemctl daemon-reload
+DAEMON_RELOAD_OK=$?
+sudo systemctl start ollama
+SERVICE_START_OK=$?
+banner "Configure Manual Shell"
+mkdir -p "$HOME/.config/environment.d"
+cat > "$HOME/.config/environment.d/ollama.conf" <<'EOF'
+OLLAMA_MODELS=/srv/ollama/models
+EOF
+ENVIRONMENTD_OK=$?
+sed -i '/^export OLLAMA_MODELS=/d' "$HOME/.bashrc"
+echo 'export OLLAMA_MODELS=/srv/ollama/models' >> "$HOME/.bashrc"
+BASHRC_OK=$?
+export OLLAMA_MODELS=/srv/ollama/models
+mapfile -t PHASE02_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+[ "$APT_UPDATE_OK" = 0 ]&&ok "APT update: OK"||warn "APT update: check needed"
+[ "$RSYNC_ACL_OK" = 0 ]&&ok "rsync / acl install: OK"||bad "rsync / acl install: FAIL"
+[ "$GROUP_OK" = 0 ]&&ok "Group exists: $OLLAMA_GROUP"||bad "Group create/reuse failed: $OLLAMA_GROUP"
+[ "$SVC_GROUP_OK" = 0 ]&&ok "Service user added to group: $SVC_USER -> $OLLAMA_GROUP"||bad "Service user group setup failed: $SVC_USER"
+[ "$LOCAL_GROUP_OK" = 0 ]&&ok "Local user added to group: $LOCAL_USER -> $OLLAMA_GROUP"||bad "Local user group setup failed: $LOCAL_USER"
+[ "$MKDIR_SRV_OK" = 0 ]&&ok "Unified model directory created: /srv/ollama/models"||bad "Unified model directory creation failed"
+[ "$MKDIR_SHARE_OK" = 0 ]&&ok "Service .ollama directory created: /usr/share/ollama/.ollama"||bad "Service .ollama directory creation failed"
+[ "$MKDIR_HOME_OK" = 0 ]&&ok "User .ollama directory created: $USER_OLLAMA_DIR"||bad "User .ollama directory creation failed"
+[ "$MKDIR_ROOT_OK" = 0 ]&&ok "Root .ollama directory created: /root/.ollama"||bad "Root .ollama directory creation failed"
+if [ "$COPY_COUNT" -gt 0 ];then
+  ok "Existing model locations copied: $COPY_COUNT"
+else
+  warn "Existing model locations copied: 0"
+  info "This is normal if no models were previously pulled."
+fi
+[ "$REPAIR_SCRIPT_OK" = 0 ]&&ok "Safer permission repair script installed"||bad "Safer permission repair script install: FAIL"
+[ "$REPAIR_RUN_OK" = 0 ]&&ok "Safer permission repair script run: OK"||bad "Safer permission repair script run: FAIL"
+if [ -x /usr/local/sbin/ollama-permission-repair ];then
+  ok "Permission repair script executable: yes"
+else
+  bad "Permission repair script executable: no"
+fi
+if [ -f /etc/systemd/system/ollama.service.d/override.conf ];then
+  ok "systemd override: present"
+else
+  bad "systemd override: missing"
+fi
+if grep -q 'OLLAMA_MODELS=/srv/ollama/models' /etc/systemd/system/ollama.service.d/override.conf 2>/dev/null;then
+  ok "systemd OLLAMA_MODELS: /srv/ollama/models"
+else
+  bad "systemd OLLAMA_MODELS: missing"
+fi
+if grep -q 'Group=ollama' /etc/systemd/system/ollama.service.d/override.conf 2>/dev/null;then
+  ok "systemd Group: ollama"
+else
+  bad "systemd Group: missing"
+fi
+if grep -q 'UMask=0002' /etc/systemd/system/ollama.service.d/override.conf 2>/dev/null;then
+  ok "systemd UMask: 0002"
+else
+  bad "systemd UMask: missing"
+fi
+if grep -q 'ExecStartPre=+/usr/local/sbin/ollama-permission-repair' /etc/systemd/system/ollama.service.d/override.conf 2>/dev/null;then
+  ok "systemd ExecStartPre repair hook: present"
+else
+  bad "systemd ExecStartPre repair hook: missing"
+fi
+if grep -q 'ExecStopPost=+/usr/local/sbin/ollama-permission-repair' /etc/systemd/system/ollama.service.d/override.conf 2>/dev/null;then
+  ok "systemd ExecStopPost repair hook: present"
+else
+  bad "systemd ExecStopPost repair hook: missing"
+fi
+[ "$OVERRIDE_OK" = 0 ]&&ok "systemd override write: OK"||bad "systemd override write: FAIL"
+[ "$DAEMON_RELOAD_OK" = 0 ]&&ok "systemd daemon-reload: OK"||bad "systemd daemon-reload: FAIL"
+[ "$SERVICE_START_OK" = 0 ]&&ok "ollama service start: OK"||bad "ollama service start: FAIL"
+active="$(systemctl is-active ollama 2>/dev/null||true)"
+failed="$(systemctl is-failed ollama 2>/dev/null||true)"
+svc_env="$(systemctl show ollama --property=Environment 2>/dev/null||true)"
+svc_umask="$(systemctl show ollama --property=UMask 2>/dev/null||true)"
+svc_group="$(systemctl show ollama --property=Group 2>/dev/null||true)"
+if [ "$active" = "active" ];then
+  ok "ollama active: yes"
+else
+  bad "ollama active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "ollama failed state: failed"
+else
+  ok "ollama failed state: clear"
+fi
+if printf "%s\n" "$svc_env"|grep -q 'OLLAMA_MODELS=/srv/ollama/models';then
+  ok "Service environment includes OLLAMA_MODELS"
+else
+  bad "Service environment missing OLLAMA_MODELS"
+fi
+if printf "%s\n" "$svc_umask"|grep -q 'UMask=0002';then
+  ok "Service UMask: 0002"
+else
+  bad "Service UMask: ${svc_umask:-unknown}"
+fi
+if printf "%s\n" "$svc_group"|grep -q 'Group=ollama';then
+  ok "Service Group: ollama"
+else
+  bad "Service Group: ${svc_group:-unknown}"
+fi
+if sudo find /srv/ollama /usr/share/ollama "$USER_OLLAMA_DIR" /root/.ollama -perm -0002 -print -quit 2>/dev/null|grep -q .;then
+  bad "World-writable Ollama path found"
+else
+  ok "World-writable Ollama paths: none"
+fi
+for d in /srv/ollama /srv/ollama/models /usr/share/ollama /usr/share/ollama/.ollama;do
+  if sudo test -d "$d";then
+    ok "Shared folder exists: $d"
+  else
+    bad "Shared folder missing: $d"
+    continue
+  fi
+  mode="$(stat -c '%a' "$d" 2>/dev/null||true)"
+  group="$(stat -c '%G' "$d" 2>/dev/null||true)"
+  [ "$mode" = "2775" ]&&ok "Shared folder mode: $d -> 2775"||bad "Shared folder mode not 2775: $d -> $mode"
+  [ "$group" = "$OLLAMA_GROUP" ]&&ok "Shared folder group: $d -> $group"||bad "Shared folder group not $OLLAMA_GROUP: $d -> $group"
+  getfacl "$d" 2>/dev/null|grep -q "user:$SVC_USER:rwx" \
+    && ok "ACL service user rwx: $d" \
+    || bad "ACL service user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "user:$LOCAL_USER:rwx" \
+    && ok "ACL local user rwx: $d" \
+    || bad "ACL local user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "^other::r-x" \
+    && ok "Other ACL read/execute only: $d" \
+    || bad "Other ACL is not safely restricted: $d"
+done
+manual_test_dir="/srv/ollama/models/.manual-cross-write-test"
+service_test_dir="/srv/ollama/models/.service-cross-write-test"
+sudo rm -rf "$manual_test_dir" "$service_test_dir"
+mkdir -p "$manual_test_dir" 2>/dev/null
+touch "$manual_test_dir/manual-created-file" 2>/dev/null
+if sudo -u "$SVC_USER" sh -c "echo service-write >> '$manual_test_dir/manual-created-file'" 2>/dev/null;then
+  ok "Service can write manual-created file: OK"
+else
+  bad "Service can write manual-created file: FAIL"
+fi
+sudo -u "$SVC_USER" mkdir -p "$service_test_dir" 2>/dev/null
+sudo -u "$SVC_USER" touch "$service_test_dir/service-created-file" 2>/dev/null
+if echo manual-write >> "$service_test_dir/service-created-file" 2>/dev/null;then
+  ok "Manual user can write service-created file: OK"
+else
+  bad "Manual user can write service-created file: FAIL"
+fi
+if id nobody >/dev/null 2>&1;then
+  if sudo -u nobody sh -c "touch /srv/ollama/models/.nobody-write-test" 2>/dev/null;then
+    bad "Unintended user nobody can write to /srv/ollama/models"
+    sudo rm -f /srv/ollama/models/.nobody-write-test
+  else
+    ok "Unintended user nobody write blocked: /srv/ollama/models"
+  fi
+else
+  skip "nobody user not available for negative write test"
+fi
+sudo rm -rf "$manual_test_dir" "$service_test_dir"
+[ "$ENVIRONMENTD_OK" = 0 ]&&ok "environment.d config: OK"||bad "environment.d config: FAIL"
+[ "$BASHRC_OK" = 0 ]&&ok "~/.bashrc OLLAMA_MODELS: OK"||bad "~/.bashrc OLLAMA_MODELS: FAIL"
+if grep -qxF 'export OLLAMA_MODELS=/srv/ollama/models' "$HOME/.bashrc";then
+  ok "~/.bashrc export: present"
+else
+  bad "~/.bashrc export: missing"
+fi
+if [ "$OLLAMA_MODELS" = "/srv/ollama/models" ];then
+  ok "Current shell OLLAMA_MODELS: /srv/ollama/models"
+else
+  bad "Current shell OLLAMA_MODELS: ${OLLAMA_MODELS:-unset}"
+fi
+)
+box "Step 02 Checks" "${PHASE02_LINES[@]}"
+if printf "%s\n" "${PHASE02_LINES[@]}" | grep -q '^\[BAD\]';then
+  box "Error" \
+  "One or more Step 02 checks failed." \
+  "Do not reboot yet." \
+  "Review the output above."
+  exit 1
+fi
+box "Important" \
+"The system will reboot now." \
+"After reboot, continue with Step 03." \
+"Ollama data folders are no longer world-writable." \
+"Only $SVC_USER, $LOCAL_USER, and members of $OLLAMA_GROUP have write access." \
+"Service start/stop repairs Ollama data-folder permissions." \
+"Log out and back in later so group membership is fully active."
+sudo reboot
