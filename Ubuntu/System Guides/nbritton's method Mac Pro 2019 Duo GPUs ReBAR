@@ -1,0 +1,825 @@
+# ReBAR MacPro7,1 Duo GPUs using nbritton's method
+
+bash <<'LINUXAI_DYNAMIC_NBRITTON_INSTALL_V2'
+set -Eeuo pipefail
+TITLE="INSTALL DYNAMIC NBRITTON-STYLE BAR RESIZE METHOD"
+LINE="=============== ${TITLE} ==============="
+BORDER="$(printf "%*s" "${#LINE}" "" | tr " " "=")"
+echo "$BORDER"
+echo "$LINE"
+echo "$BORDER"
+KEEPALIVE_PID=""
+cleanup() {
+  if [ -n "${KEEPALIVE_PID:-}" ]; then
+    kill "$KEEPALIVE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+echo
+echo "Acquire sudo once and keep it alive:"
+sudo -v
+while true; do
+  sudo -n true 2>/dev/null || true
+  sleep 30
+done &
+KEEPALIVE_PID="$!"
+echo
+echo "Install required packages:"
+sudo DEBIAN_FRONTEND=noninteractive apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pciutils python3 initramfs-tools
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+BACKUP="$HOME/linuxai-dynamic-nbritton-backup-$STAMP"
+mkdir -p "$BACKUP"
+echo
+echo "Backup existing files:"
+sudo cp -a /etc/default/grub "$BACKUP/grub.before" 2>/dev/null || true
+sudo cp -a /usr/local/sbin/resize_gpu_bars.sh "$BACKUP/resize_gpu_bars.sh.before" 2>/dev/null || true
+sudo cp -a /etc/systemd/system/resize-gpu-bars.service "$BACKUP/resize-gpu-bars.service.before" 2>/dev/null || true
+sudo cp -a /etc/systemd/system/amdgpu-bar-resize.service "$BACKUP/amdgpu-bar-resize.service.before" 2>/dev/null || true
+sudo cp -a /etc/modprobe.d/amdgpu-blacklist.conf "$BACKUP/amdgpu-blacklist.conf.before" 2>/dev/null || true
+sudo cp -a /etc/initramfs-tools/hooks/linuxai-amdgpu-blacklist "$BACKUP/linuxai-amdgpu-blacklist.before" 2>/dev/null || true
+sudo cp -a /etc/default/resize-gpu-bars "$BACKUP/resize-gpu-bars.default.before" 2>/dev/null || true
+echo "$BACKUP"
+echo
+echo "Remove old installed files and services:"
+sudo systemctl disable --now resize-gpu-bars.service 2>/dev/null || true
+sudo systemctl disable --now amdgpu-bar-resize.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/resize-gpu-bars.service
+sudo rm -f /etc/systemd/system/amdgpu-bar-resize.service
+sudo rm -f /etc/systemd/system/multi-user.target.wants/resize-gpu-bars.service
+sudo rm -f /etc/systemd/system/multi-user.target.wants/amdgpu-bar-resize.service
+sudo rm -f /usr/local/sbin/resize_gpu_bars.sh
+sudo rm -f /etc/modprobe.d/amdgpu-blacklist.conf
+sudo rm -f /etc/initramfs-tools/hooks/linuxai-amdgpu-blacklist
+sudo rm -f /etc/default/resize-gpu-bars
+sudo systemctl daemon-reload
+echo
+echo "Write runtime defaults:"
+sudo tee /etc/default/resize-gpu-bars >/dev/null <<'DEFAULTS_EOF'
+# Dynamic nbritton-style AMD BAR resize settings.
+#
+# Default target cap is 32 GiB:
+#   ReBAR index 15 => 2^(15+20) bytes = 32 GiB.
+#
+# For 64 GiB GPUs, advanced users may set:
+#   LINUXAI_TARGET_REBAR_INDEX_MAX=16
+#
+# Safety defaults:
+#   - Restrict to MacPro7,1 by default.
+#   - Skip AMD GPUs behind Thunderbolt by default.
+LINUXAI_TARGET_REBAR_INDEX_MAX=15
+LINUXAI_REQUIRE_MACPRO71=1
+LINUXAI_ALLOW_THUNDERBOLT_GPUS=0
+DEFAULTS_EOF
+echo
+echo "Write amdgpu blacklist:"
+sudo tee /etc/modprobe.d/amdgpu-blacklist.conf >/dev/null <<'BLACKLIST_EOF'
+# Prevent amdgpu from autoloading before resize-gpu-bars.service runs.
+# The service explicitly loads amdgpu after direct ReBAR write + PCI remove/rescan.
+blacklist amdgpu
+BLACKLIST_EOF
+echo
+echo "Write initramfs hook:"
+sudo tee /etc/initramfs-tools/hooks/linuxai-amdgpu-blacklist >/dev/null <<'HOOK_EOF'
+#!/bin/sh
+set -e
+PREREQ=""
+prereqs()
+{
+  echo "$PREREQ"
+}
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+if [ -f /etc/modprobe.d/amdgpu-blacklist.conf ]; then
+  mkdir -p "$DESTDIR/etc/modprobe.d"
+  cp -p /etc/modprobe.d/amdgpu-blacklist.conf "$DESTDIR/etc/modprobe.d/amdgpu-blacklist.conf"
+fi
+exit 0
+HOOK_EOF
+sudo chmod 755 /etc/initramfs-tools/hooks/linuxai-amdgpu-blacklist
+echo
+echo "Write dynamic resize script:"
+sudo tee /usr/local/sbin/resize_gpu_bars.sh >/dev/null <<'SCRIPT_EOF'
+#!/bin/bash
+set -euo pipefail
+GPU_BDFS=()
+TARGET_BDFS=()
+TARGET_INDEXES=()
+REBAR_CAP_OFFSETS=()
+REBAR_CTRL_OFFSETS=()
+AUDIO_BDFS=()
+TOP_BRIDGES=()
+BRIDGE_CHAIN_BDFS=()
+TARGET_INDEX_MAX="${LINUXAI_TARGET_REBAR_INDEX_MAX:-15}"
+REQUIRE_MACPRO71="${LINUXAI_REQUIRE_MACPRO71:-1}"
+ALLOW_THUNDERBOLT_GPUS="${LINUXAI_ALLOW_THUNDERBOLT_GPUS:-0}"
+log_info() { echo "[INFO] $*" >&2; }
+log_ok() { echo "[OK] $*" >&2; }
+log_warn() { echo "[WARN] $*" >&2; }
+log_err() { echo "[ERROR] $*" >&2; }
+uniq_add() {
+  local arr_name="$1"
+  local value="$2"
+  local current
+  eval "current=(\"\${${arr_name}[@]:-}\")"
+  for x in "${current[@]}"; do
+    [ "$x" = "$value" ] && return 0
+  done
+  eval "${arr_name}+=(\"\$value\")"
+}
+idx_to_bytes() {
+  local idx="$1"
+  echo $((1 << (idx + 20)))
+}
+idx_to_human() {
+  local idx="$1"
+  if ! [ "$idx" -ge 0 ] 2>/dev/null; then
+    echo "unknown"
+    return
+  fi
+  local bytes
+  bytes="$(idx_to_bytes "$idx")"
+  if [ "$bytes" -ge 1073741824 ]; then
+    echo "$((bytes / 1073741824)) GiB"
+  elif [ "$bytes" -ge 1048576 ]; then
+    echo "$((bytes / 1048576)) MiB"
+  else
+    echo "$((bytes / 1024)) KiB"
+  fi
+}
+is_amd_display_gpu() {
+  local dev="$1"
+  local vendor class
+  vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+  class="$(cat "$dev/class" 2>/dev/null || true)"
+  [ "$vendor" = "0x1002" ] || return 1
+  case "$class" in
+    0x030000|0x038000) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+is_amd_audio_function() {
+  local dev="$1"
+  local vendor class
+  vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+  class="$(cat "$dev/class" 2>/dev/null || true)"
+  [ "$vendor" = "0x1002" ] || return 1
+  [ "$class" = "0x040300" ] || return 1
+}
+find_rebar_cap_offset() {
+  local bdf="$1"
+  local off=256
+  local loops=0
+  while [ "$off" -ge 256 ] && [ "$off" -le 4092 ] && [ "$loops" -lt 64 ]; do
+    local off_hex hdr val cap_id next
+    off_hex="$(printf "%03x" "$off")"
+    hdr="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null || true)"
+    [ -n "$hdr" ] || return 1
+    val=$((16#$hdr))
+    cap_id=$((val & 0xffff))
+    next=$(((val >> 20) & 0xfff))
+    if [ "$cap_id" -eq 21 ]; then
+      printf "%d\n" "$off"
+      return 0
+    fi
+    [ "$next" -eq 0 ] && break
+    [ "$next" -eq "$off" ] && break
+    off="$next"
+    loops=$((loops + 1))
+  done
+  return 1
+}
+read_rebar_size_index_at_ctrl() {
+  local bdf="$1"
+  local ctrl_off="$2"
+  local off_hex ctrl_val
+  off_hex="$(printf "%03x" "$ctrl_off")"
+  ctrl_val="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null)" || {
+    echo "-1"
+    return
+  }
+  echo $(((16#$ctrl_val >> 8) & 0x3f))
+}
+write_rebar_size_index_at_ctrl() {
+  local bdf="$1"
+  local ctrl_off="$2"
+  local new_index="$3"
+  local off_hex ctrl_val current_int cleared new_val new_hex readback
+  off_hex="$(printf "%03x" "$ctrl_off")"
+  ctrl_val="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null)" || return 1
+  current_int=$((16#$ctrl_val))
+  cleared=$((current_int & ~0x3f00))
+  new_val=$((cleared | (new_index << 8)))
+  new_hex="$(printf "%08x" "$new_val")"
+  setpci -s "$bdf" "${off_hex}.l=${new_hex}" 2>/dev/null || return 1
+  readback="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+  [ "$readback" = "$new_index" ]
+}
+read_resource0_resize_mask() {
+  local bdf="$1"
+  local f="/sys/bus/pci/devices/$bdf/resource0_resize"
+  local raw
+  [ -r "$f" ] || return 1
+  raw="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"
+  raw="${raw#0x}"
+  [ -n "$raw" ] || return 1
+  echo $((16#$raw))
+}
+highest_supported_index_le_max() {
+  local mask="$1"
+  local max_idx="$2"
+  local i
+  for ((i=max_idx; i>=0; i--)); do
+    if (( mask & (1 << i) )); then
+      echo "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+path_bdfs_for_device() {
+  local bdf="$1"
+  local path part
+  path="$(readlink -f "/sys/bus/pci/devices/$bdf" 2>/dev/null || true)"
+  [ -n "$path" ] || return 1
+  IFS='/' read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      ????\:??\:??.?)
+        echo "$part"
+        ;;
+    esac
+  done
+}
+device_is_bridge() {
+  local bdf="$1"
+  local class
+  class="$(cat "/sys/bus/pci/devices/$bdf/class" 2>/dev/null || true)"
+  case "$class" in
+    0x0604*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+find_top_bridge_for_gpu() {
+  local bdf="$1"
+  local bridges=()
+  local p bus chosen=""
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    if device_is_bridge "$p"; then
+      bridges+=("$p")
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+  [ "${#bridges[@]}" -gt 0 ] || return 1
+  for p in "${bridges[@]}"; do
+    bus="${p#*:}"
+    bus="${bus%%:*}"
+    if [ "$bus" != "00" ]; then
+      chosen="$p"
+      break
+    fi
+  done
+  [ -n "$chosen" ] || chosen="${bridges[0]}"
+  echo "$chosen"
+}
+add_bridge_chain_for_gpu() {
+  local bdf="$1"
+  local p
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    if device_is_bridge "$p"; then
+      uniq_add BRIDGE_CHAIN_BDFS "$p"
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+}
+is_under_thunderbolt() {
+  local bdf="$1"
+  local p vendor device
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    vendor="$(cat "/sys/bus/pci/devices/$p/vendor" 2>/dev/null || true)"
+    device="$(cat "/sys/bus/pci/devices/$p/device" 2>/dev/null || true)"
+    if [ "$vendor" = "0x8086" ]; then
+      case "$device" in
+        0x15ea|0x15eb|0x15ec)
+          return 0
+          ;;
+      esac
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+  return 1
+}
+discover_audio_for_gpu() {
+  local gpu="$1"
+  local slot="${gpu%.*}"
+  local dev bdf
+  for dev in /sys/bus/pci/devices/"$slot".*; do
+    [ -e "$dev" ] || continue
+    bdf="$(basename "$dev")"
+    if is_amd_audio_function "$dev"; then
+      uniq_add AUDIO_BDFS "$bdf"
+    fi
+  done
+}
+discover_targets() {
+  GPU_BDFS=()
+  TARGET_BDFS=()
+  TARGET_INDEXES=()
+  REBAR_CAP_OFFSETS=()
+  REBAR_CTRL_OFFSETS=()
+  AUDIO_BDFS=()
+  TOP_BRIDGES=()
+  BRIDGE_CHAIN_BDFS=()
+  local dev bdf mask target_idx cap_off ctrl_off top_bridge
+  while read -r dev; do
+    bdf="$(basename "$dev")"
+    GPU_BDFS+=("$bdf")
+    if [ "$ALLOW_THUNDERBOLT_GPUS" != "1" ] && is_under_thunderbolt "$bdf"; then
+      log_warn "Skipping $bdf because it appears to be behind Thunderbolt. Set LINUXAI_ALLOW_THUNDERBOLT_GPUS=1 to override."
+      continue
+    fi
+    if ! cap_off="$(find_rebar_cap_offset "$bdf")"; then
+      log_warn "Skipping $bdf: no ReBAR extended capability found."
+      continue
+    fi
+    if ! mask="$(read_resource0_resize_mask "$bdf")"; then
+      log_warn "Skipping $bdf: resource0_resize not readable for BAR0 capability discovery."
+      continue
+    fi
+    if ! target_idx="$(highest_supported_index_le_max "$mask" "$TARGET_INDEX_MAX")"; then
+      log_warn "Skipping $bdf: no supported BAR0 size at or below index $TARGET_INDEX_MAX."
+      continue
+    fi
+    if [ "$target_idx" -le 8 ]; then
+      log_warn "Skipping $bdf: largest allowed BAR0 size is only $(idx_to_human "$target_idx")."
+      continue
+    fi
+    ctrl_off=$((cap_off + 8))
+    if ! top_bridge="$(find_top_bridge_for_gpu "$bdf")"; then
+      log_warn "Skipping $bdf: could not identify removable top bridge."
+      continue
+    fi
+    TARGET_BDFS+=("$bdf")
+    TARGET_INDEXES+=("$target_idx")
+    REBAR_CAP_OFFSETS+=("$cap_off")
+    REBAR_CTRL_OFFSETS+=("$ctrl_off")
+    uniq_add TOP_BRIDGES "$top_bridge"
+    add_bridge_chain_for_gpu "$bdf"
+    discover_audio_for_gpu "$bdf"
+  done < <(for d in /sys/bus/pci/devices/*; do
+            [ -e "$d" ] || continue
+            if is_amd_display_gpu "$d"; then
+              echo "$d"
+            fi
+          done | sort)
+}
+verify_macpro() {
+  local product=""
+  product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  if [ "$REQUIRE_MACPRO71" = "1" ]; then
+    if [ "$product" != "MacPro7,1" ]; then
+      log_err "This installer is restricted to MacPro7,1 by default. Detected product_name='$product'."
+      log_err "Set LINUXAI_REQUIRE_MACPRO71=0 in /etc/default/resize-gpu-bars only if you know what you are doing."
+      exit 1
+    fi
+    log_ok "Detected MacPro7,1."
+  else
+    log_warn "MacPro7,1 requirement disabled. Detected product_name='$product'."
+  fi
+}
+ensure_amdgpu_loaded() {
+  if ! lsmod | grep -q "^amdgpu "; then
+    log_info "Loading amdgpu fallback..."
+    modprobe amdgpu 2>/dev/null || true
+  fi
+}
+print_discovery() {
+  echo >&2
+  log_info "Detected AMD display GPUs: ${#GPU_BDFS[@]}"
+  for bdf in "${GPU_BDFS[@]}"; do
+    echo " GPU: $bdf $(lspci -s "$bdf" 2>/dev/null || true)" >&2
+  done
+  echo >&2
+  log_info "Target GPUs with BAR0 ReBAR support: ${#TARGET_BDFS[@]}"
+  local i
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    echo " TARGET: $bdf cap=0x$(printf "%x" "${REBAR_CAP_OFFSETS[$i]}") ctrl=0x$(printf "%x" "${REBAR_CTRL_OFFSETS[$i]}") target_index=${TARGET_INDEXES[$i]} target_size=$(idx_to_human "${TARGET_INDEXES[$i]}")" >&2
+  done
+  echo >&2
+  log_info "Audio functions to unbind if bound: ${AUDIO_BDFS[*]:-none}"
+  log_info "Top bridge subtrees to remove/rescan: ${TOP_BRIDGES[*]:-none}"
+  log_info "Bridge chain diagnostics: ${BRIDGE_CHAIN_BDFS[*]:-none}"
+}
+phase1_diagnose() {
+  echo "============================================================" >&2
+  echo " Phase 1: Dynamic Discovery and Pre-Resize Diagnostics" >&2
+  echo "============================================================" >&2
+  if [ "$EUID" -ne 0 ]; then
+    log_err "This script must run as root."
+    exit 1
+  fi
+  verify_macpro
+  if grep -q "pci=realloc" /proc/cmdline; then
+    log_ok "Kernel booted with pci=realloc."
+  else
+    log_err "Kernel NOT booted with pci=realloc. Required for bridge window resizing."
+    exit 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    log_err "setpci not found. Install pciutils."
+    exit 1
+  fi
+  if lsmod | grep -q "^amdgpu "; then
+    log_warn "amdgpu already loaded. Will unbind target GPUs before resize."
+  else
+    log_ok "amdgpu not loaded. Clean single-init path."
+  fi
+  discover_targets
+  print_discovery
+  if [ "${#TARGET_BDFS[@]}" -eq 0 ]; then
+    log_warn "No suitable AMD ReBAR BAR0 targets found. Loading amdgpu and exiting without resize."
+    ensure_amdgpu_loaded
+    exit 0
+  fi
+  local i bdf ctrl_off cur_idx resource0 bar_start bar_end bar_size
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    ctrl_off="${REBAR_CTRL_OFFSETS[$i]}"
+    echo >&2
+    log_info "GPU $bdf"
+    if [ -r "/sys/bus/pci/devices/$bdf/resource" ]; then
+      resource0="$(head -1 "/sys/bus/pci/devices/$bdf/resource")"
+      bar_start="$(echo "$resource0" | awk '{print $1}')"
+      bar_end="$(echo "$resource0" | awk '{print $2}')"
+      if [ "$bar_start" != "0x0000000000000000" ]; then
+        bar_size=$((16#${bar_end#0x} - 16#${bar_start#0x} + 1))
+        log_info "BAR0 current size: $(numfmt --to=iec-i --suffix=B "$bar_size" 2>/dev/null || echo "$bar_size bytes")"
+      fi
+    fi
+    cur_idx="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+    log_info "Current ReBAR index: $cur_idx ($(idx_to_human "$cur_idx"))"
+    log_info "Target ReBAR index: ${TARGET_INDEXES[$i]} ($(idx_to_human "${TARGET_INDEXES[$i]}"))"
+  done
+  echo >&2
+  log_info "Bridge prefetchable windows before resize:"
+  for bdf in "${BRIDGE_CHAIN_BDFS[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bdf" ]; then
+      pref="$(lspci -vvs "$bdf" 2>/dev/null | grep -i "Prefetchable memory behind" || true)"
+      [ -n "$pref" ] && echo " $bdf: $(echo "$pref" | sed 's/.*://' | xargs)" >&2
+    fi
+  done
+}
+phase2_resize() {
+  echo >&2
+  echo "============================================================" >&2
+  echo " Phase 2: Direct setpci ReBAR + PCI Subtree Reset" >&2
+  echo "============================================================" >&2
+  local any_driver_bound=false bdf drv i before after ctrl_off target_idx bridge
+  for bdf in "${AUDIO_BDFS[@]}" "${TARGET_BDFS[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bdf/driver" ]; then
+      any_driver_bound=true
+      break
+    fi
+  done
+  if $any_driver_bound; then
+    log_info "Unbinding bound target GPU/audio drivers..."
+    for bdf in "${AUDIO_BDFS[@]}" "${TARGET_BDFS[@]}"; do
+      if [ -e "/sys/bus/pci/devices/$bdf/driver" ]; then
+        drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+        if echo "$bdf" > "/sys/bus/pci/drivers/$drv/unbind" 2>/dev/null; then
+          log_ok "Unbound $drv from $bdf"
+        else
+          log_warn "Could not unbind $drv from $bdf"
+        fi
+      fi
+    done
+    sleep 2
+  else
+    log_ok "No target GPU/audio drivers to unbind."
+  fi
+  log_info "Writing ReBAR control registers..."
+  local rebar_ok=true
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    ctrl_off="${REBAR_CTRL_OFFSETS[$i]}"
+    target_idx="${TARGET_INDEXES[$i]}"
+    before="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+    log_info "$bdf before index $before ($(idx_to_human "$before"))"
+    if [ "$before" = "$target_idx" ]; then
+      log_ok "$bdf already at target index $target_idx"
+      continue
+    fi
+    if write_rebar_size_index_at_ctrl "$bdf" "$ctrl_off" "$target_idx"; then
+      after="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+      log_ok "$bdf written to index $after ($(idx_to_human "$after"))"
+    else
+      log_err "$bdf ReBAR write failed."
+      rebar_ok=false
+    fi
+  done
+  if ! $rebar_ok; then
+    log_err "At least one ReBAR write failed."
+    return 1
+  fi
+  log_info "Removing top-level PCI bridge subtrees..."
+  for bridge in "${TOP_BRIDGES[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bridge" ]; then
+      log_info "Removing $bridge"
+      echo 1 > "/sys/bus/pci/devices/$bridge/remove"
+      log_ok "Removed $bridge"
+    else
+      log_warn "$bridge not present."
+    fi
+  done
+  sleep 3
+  log_info "Rescanning PCI bus..."
+  echo 1 > /sys/bus/pci/rescan
+  sleep 5
+  log_info "Loading amdgpu..."
+  if ! lsmod | grep -q "^amdgpu "; then
+    modprobe amdgpu
+  fi
+  sleep 15
+  log_ok "amdgpu initialized."
+}
+phase3_verify() {
+  echo >&2
+  echo "============================================================" >&2
+  echo " Phase 3: Verification After Rescan" >&2
+  echo "============================================================" >&2
+  box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+  mapfile -t BAR_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+mapfile -t GPU_BDFS < <(
+  for d in /sys/bus/pci/devices/*;do
+    [ -e "$d" ]||continue
+    [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ]||continue
+    c="$(cat "$d/class" 2>/dev/null||true)"
+    case "$c" in 0x030000|0x038000) basename "$d";; esac
+  done|sort
+)
+BIND_BAD=0;BAD_BAR=0;GPU_N=0
+if [ "${#GPU_BDFS[@]}" -eq 0 ];then
+  echo "---- Final Diagnosis ----"
+  bad "Detected GPUs: 0"
+  skip "Wrong BAR0 GPUs: 0"
+  skip "Not bound to amdgpu: 0"
+  skip "BAR0 Check: SKIPPED"
+  skip "amdgpu Binding Check: SKIPPED"
+  bad "Result: No AMD display GPUs detected"
+  echo
+  echo "---- Comments ----"
+  warn "Check PCIe enumeration, power,"
+  warn "slot topology, and bridge state."
+else
+  for bdf in "${GPU_BDFS[@]}";do
+    echo "---- GPU $GPU_N: $bdf ----"
+    GPU_N=$((GPU_N+1))
+    pci="$(lspci -vv -s "$bdf" 2>/dev/null||true)"
+    bar0="$(printf "%s\n" "$pci"|grep -m1 "Region 0:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    bar2="$(printf "%s\n" "$pci"|grep -m1 "Region 2:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    [ -n "$bar0" ]||bar0="not-found"
+    [ -n "$bar2" ]||bar2="not-found"
+    if [ -L "/sys/bus/pci/devices/$bdf/driver" ];then
+      drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+    else
+      drv="none"
+    fi
+    ctrl="$(sudo setpci -s "$bdf" 208.l 2>/dev/null||true)"
+    if [ -n "$ctrl" ];then
+      idx=$(((16#$ctrl>>8)&0x3f))
+    else
+      idx="not-available"
+    fi
+    bar_ok=0
+    [ "$bar0" = "32G" ]&&bar_ok=1
+    [ "$idx" = 15 ]&&bar_ok=1
+    [ "$bar0" = "32G" ]&&ok "BAR0: $bar0"||bad "BAR0: $bar0"
+    [ "$bar2" != "not-found" ]&&ok "BAR2: $bar2"||warn "BAR2: $bar2"
+    [ "$drv" = "amdgpu" ]&&ok "Driver: $drv"||bad "Driver: $drv"
+    [ "$idx" = 15 ]&&ok "BAR0 Size Index: $idx"||bad "BAR0 Size Index: $idx"
+    if [ "$bar_ok" = 1 ];then
+      ok "BAR0 / ReBAR status: OK"
+    else
+      BAD_BAR=$((BAD_BAR+1))
+      bad "BAR0 / ReBAR status: BAD"
+    fi
+    [ "$drv" = "amdgpu" ]||BIND_BAD=$((BIND_BAD+1))
+    echo
+  done
+  if [ "$BAD_BAR" -eq 0 ];then BAR_CHECK="OK";else BAR_CHECK="BAD";fi
+  if [ "$BIND_BAD" -eq 0 ];then BIND_CHECK="OK";else BIND_CHECK="BAD";fi
+  echo "---- Final Diagnosis ----"
+  ok "Detected GPUs: ${#GPU_BDFS[@]}"
+  if [ "$BAD_BAR" -eq 0 ];then
+    ok "Wrong BAR0 GPUs: $BAD_BAR"
+    ok "BAR0 Check: $BAR_CHECK"
+  else
+    bad "Wrong BAR0 GPUs: $BAD_BAR"
+    bad "BAR0 Check: $BAR_CHECK"
+  fi
+  if [ "$BIND_BAD" -eq 0 ];then
+    ok "Not bound to amdgpu: $BIND_BAD"
+    ok "amdgpu Binding Check: $BIND_CHECK"
+  else
+    bad "Not bound to amdgpu: $BIND_BAD"
+    bad "amdgpu Binding Check: $BIND_CHECK"
+  fi
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "Result: BAR0 / ReBAR OK, and GPUs Initialized Correctly"
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "Result: BAR0 / ReBAR Failed"
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    bad "Result: BAR0 / ReBAR OK, and amdgpu Binding Failed"
+  else
+    bad "Result: GPUs Failed to Initialize Correctly"
+  fi
+  echo
+  echo "---- Comments ----"
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "BAR0 / ReBAR OK."
+    ok "GPUs Initialized Correctly."
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "BAR0 / ReBAR Failed."
+    warn "Consider nbritton's method."
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    ok "BAR0 / ReBAR OK."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  else
+    bad "GPUs Failed to Initialize Correctly."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  fi
+fi
+)
+  box "GPU BAR0 / ReBAR Diagnosis" "${BAR_LINES[@]}"
+}
+main() {
+  local mode="${1:---resize}"
+  echo "============================================================" >&2
+  echo " Dynamic nbritton-style AMD BAR resize" >&2
+  echo " Direct setpci ReBAR + PCI remove/rescan + modprobe amdgpu" >&2
+  echo "============================================================" >&2
+  if [ "$mode" = "--discover-only" ]; then
+    verify_macpro
+    discover_targets
+    print_discovery
+    exit 0
+  fi
+  phase1_diagnose
+  if [ "$mode" = "--diagnose-only" ]; then
+    log_info "Diagnostics complete."
+    exit 0
+  fi
+  if [ "$mode" != "--force" ]; then
+    read -rp "Proceed? (y/N): " confirm
+    if [ "${confirm,,}" != "y" ]; then
+      log_info "Aborted."
+      exit 0
+    fi
+  fi
+  trap 'ensure_amdgpu_loaded' EXIT
+  if phase2_resize; then
+    trap - EXIT
+    phase3_verify
+  else
+    log_err "Resize failed. amdgpu fallback will be attempted."
+    exit 1
+  fi
+  echo "============================================================" >&2
+  echo " Done. Verify with: rocminfo" >&2
+  echo "============================================================" >&2
+}
+main "$@"
+SCRIPT_EOF
+sudo chmod 755 /usr/local/sbin/resize_gpu_bars.sh
+echo
+echo "Write systemd service:"
+sudo tee /etc/systemd/system/resize-gpu-bars.service >/dev/null <<'SERVICE_EOF'
+[Unit]
+Description=Dynamic nbritton-style AMD GPU BAR resize and amdgpu load
+DefaultDependencies=no
+Requires=local-fs.target sysinit.target systemd-udevd.service
+After=sysinit.target local-fs.target systemd-udevd.service systemd-modules-load.service
+Before=display-manager.service graphical.target multi-user.target
+Before=modprobe@amdgpu.service
+Wants=systemd-udevd.service
+FailureAction=none
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/resize-gpu-bars
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+ExecStart=/usr/local/sbin/resize_gpu_bars.sh --force
+RemainAfterExit=yes
+TimeoutStartSec=240
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_OVERRIDE CAP_SYS_MODULE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_SYS_MODULE
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/bus/pci /sys/devices
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=no
+ProtectKernelModules=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=resize-gpu-bars
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+echo
+echo "Validate installed files:"
+sudo bash -n /usr/local/sbin/resize_gpu_bars.sh
+sudo sh -n /etc/initramfs-tools/hooks/linuxai-amdgpu-blacklist
+sudo systemd-analyze verify /etc/systemd/system/resize-gpu-bars.service 2>/dev/null || true
+echo
+echo "Add only pci=realloc to GRUB_CMDLINE_LINUX_DEFAULT:"
+sudo python3 - <<'PY'
+from pathlib import Path
+p = Path("/etc/default/grub")
+s = p.read_text() if p.exists() else ""
+lines = s.splitlines()
+out = []
+found = False
+for line in lines:
+    if line.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+        found = True
+        key, val = line.split("=", 1)
+        val = val.strip()
+        if len(val) >= 2 and val[0] in ("'", '"') and val[-1] == val[0]:
+            flags = val[1:-1].split()
+        else:
+            flags = val.split()
+        if "pci=realloc" not in flags:
+            flags.append("pci=realloc")
+        line = key + '="' + " ".join(flags) + '"'
+    out.append(line)
+if not found:
+    out.append('GRUB_CMDLINE_LINUX_DEFAULT="pci=realloc"')
+p.write_text("\n".join(out) + "\n")
+PY
+echo
+echo "Enable service:"
+sudo systemctl daemon-reload
+sudo systemctl enable resize-gpu-bars.service
+echo
+echo "Rebuild initramfs and update GRUB:"
+sudo update-initramfs -u -k all
+sudo update-grub
+echo
+echo "Verification:"
+KREL="$(uname -r)"
+INITRD="/boot/initrd.img-${KREL}"
+echo
+echo "--- GRUB default flags ---"
+grep -E "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub
+echo
+echo "--- generated grub.cfg current-kernel lines ---"
+GRUB_LINES="$(sudo grep "vmlinuz-${KREL}" /boot/grub/grub.cfg || true)"
+printf "%s\n" "$GRUB_LINES"
+echo
+echo "--- pci=realloc present in generated grub.cfg ---"
+if [[ "$GRUB_LINES" == *"pci=realloc"* ]]; then
+  echo "OK: pci=realloc present"
+else
+  echo "ERROR: pci=realloc missing"
+  false
+fi
+echo
+echo "--- blacklist present in initramfs ---"
+INITRD_LIST="$(sudo lsinitramfs "$INITRD")"
+INITRD_LIST_PADDED=$'\n'"$INITRD_LIST"$'\n'
+if [[ "$INITRD_LIST_PADDED" == *$'\netc/modprobe.d/amdgpu-blacklist.conf\n'* ]]; then
+  echo "OK: amdgpu blacklist present in initramfs"
+else
+  echo "ERROR: amdgpu blacklist missing from initramfs"
+  echo "Relevant initramfs entries:"
+  printf "%s\n" "$INITRD_LIST" | grep -Ei 'modprobe\.d|amdgpu|blacklist|linuxai' || true
+  false
+fi
+echo
+echo "--- service enabled ---"
+systemctl is-enabled resize-gpu-bars.service
+echo
+echo "--- dynamic discovery preview, no writes ---"
+sudo env \
+  LINUXAI_TARGET_REBAR_INDEX_MAX=15 \
+  LINUXAI_REQUIRE_MACPRO71=1 \
+  LINUXAI_ALLOW_THUNDERBOLT_GPUS=0 \
+  /usr/local/sbin/resize_gpu_bars.sh --discover-only || true
+echo
+echo "Installed successfully."
+echo "No reboot was performed."
+echo "Manual next step when ready:"
+echo "sudo reboot"
+LINUXAI_DYNAMIC_NBRITTON_INSTALL_V2
