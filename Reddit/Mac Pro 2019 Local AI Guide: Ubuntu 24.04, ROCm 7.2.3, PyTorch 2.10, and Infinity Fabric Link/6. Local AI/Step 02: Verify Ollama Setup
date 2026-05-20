@@ -1,0 +1,218 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Verify Ollama Permission Safety"
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+LOCAL_USER="${SUDO_USER:-$USER}"
+[ -n "$LOCAL_USER" ]||LOCAL_USER="$(id -un)"
+SVC_USER="$(systemctl show ollama -p User --value 2>/dev/null||true)"
+[ -n "$SVC_USER" ]||SVC_USER="ollama"
+OLLAMA_GROUP="ollama"
+USER_OLLAMA_DIR="$HOME/.ollama"
+mapfile -t VERIFY_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+info "Local user: $LOCAL_USER"
+info "Service user: $SVC_USER"
+info "Shared group: $OLLAMA_GROUP"
+if getent group "$OLLAMA_GROUP" >/dev/null 2>&1;then
+  ok "Group exists: $OLLAMA_GROUP"
+else
+  bad "Group missing: $OLLAMA_GROUP"
+fi
+if id -nG "$LOCAL_USER" 2>/dev/null|tr ' ' '\n'|grep -qx "$OLLAMA_GROUP";then
+  ok "Local user is in group: $LOCAL_USER -> $OLLAMA_GROUP"
+else
+  bad "Local user is not in group: $LOCAL_USER -> $OLLAMA_GROUP"
+fi
+if id -nG "$SVC_USER" 2>/dev/null|tr ' ' '\n'|grep -qx "$OLLAMA_GROUP";then
+  ok "Service user is in group: $SVC_USER -> $OLLAMA_GROUP"
+else
+  bad "Service user is not in group: $SVC_USER -> $OLLAMA_GROUP"
+fi
+active="$(systemctl is-active ollama 2>/dev/null||true)"
+failed="$(systemctl is-failed ollama 2>/dev/null||true)"
+svc_env="$(systemctl show ollama --property=Environment 2>/dev/null||true)"
+svc_umask="$(systemctl show ollama --property=UMask 2>/dev/null||true)"
+svc_group="$(systemctl show ollama --property=Group 2>/dev/null||true)"
+[ "$active" = "active" ]&&ok "ollama active: yes"||bad "ollama active: ${active:-unknown}"
+[ "$failed" = "failed" ]&&bad "ollama failed state: failed"||ok "ollama failed state: clear"
+printf "%s\n" "$svc_env"|grep -q 'OLLAMA_MODELS=/srv/ollama/models' \
+  && ok "Service OLLAMA_MODELS: /srv/ollama/models" \
+  || bad "Service OLLAMA_MODELS missing"
+printf "%s\n" "$svc_umask"|grep -q 'UMask=0002' \
+  && ok "Service UMask: 0002" \
+  || bad "Service UMask: ${svc_umask:-unknown}"
+printf "%s\n" "$svc_group"|grep -q "Group=$OLLAMA_GROUP" \
+  && ok "Service Group: $OLLAMA_GROUP" \
+  || bad "Service Group: ${svc_group:-unknown}"
+if [ -x /usr/local/sbin/ollama-permission-repair ];then
+  ok "Permission repair script: executable"
+else
+  bad "Permission repair script: missing or not executable"
+fi
+if systemctl cat ollama 2>/dev/null|grep -q 'ExecStartPre=+/usr/local/sbin/ollama-permission-repair';then
+  ok "ExecStartPre permission hook: present"
+else
+  bad "ExecStartPre permission hook: missing"
+fi
+if systemctl cat ollama 2>/dev/null|grep -q 'ExecStopPost=+/usr/local/sbin/ollama-permission-repair';then
+  ok "ExecStopPost permission hook: present"
+else
+  bad "ExecStopPost permission hook: missing"
+fi
+for d in /srv/ollama /srv/ollama/models /usr/share/ollama /usr/share/ollama/.ollama;do
+  if sudo test -d "$d";then
+    ok "Shared folder exists: $d"
+  else
+    bad "Shared folder missing: $d"
+    continue
+  fi
+  mode="$(stat -c '%a' "$d" 2>/dev/null||true)"
+  owner="$(stat -c '%U' "$d" 2>/dev/null||true)"
+  group="$(stat -c '%G' "$d" 2>/dev/null||true)"
+  [ "$mode" = "2775" ]&&ok "Shared folder mode: $d -> 2775"||bad "Shared folder mode not 2775: $d -> $mode"
+  [ "$group" = "$OLLAMA_GROUP" ]&&ok "Shared folder group: $d -> $group"||bad "Shared folder group not $OLLAMA_GROUP: $d -> $group"
+  info "Shared folder owner: $d -> $owner"
+  getfacl "$d" 2>/dev/null|grep -q "user:$SVC_USER:rwx" \
+    && ok "ACL service user rwx: $d" \
+    || bad "ACL service user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "user:$LOCAL_USER:rwx" \
+    && ok "ACL local user rwx: $d" \
+    || bad "ACL local user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "group:$OLLAMA_GROUP:rwx" \
+    && ok "ACL group rwx: $d" \
+    || bad "ACL group rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "default:user:$SVC_USER:rwx" \
+    && ok "Default ACL service user rwx: $d" \
+    || bad "Default ACL service user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "default:user:$LOCAL_USER:rwx" \
+    && ok "Default ACL local user rwx: $d" \
+    || bad "Default ACL local user rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "default:group:$OLLAMA_GROUP:rwx" \
+    && ok "Default ACL group rwx: $d" \
+    || bad "Default ACL group rwx missing: $d"
+  getfacl "$d" 2>/dev/null|grep -q "^other::r-x" \
+    && ok "Other ACL read/execute only: $d" \
+    || bad "Other ACL is not safely restricted: $d"
+  getfacl "$d" 2>/dev/null|grep -q "^default:other::r-x" \
+    && ok "Default other ACL read/execute only: $d" \
+    || bad "Default other ACL is not safely restricted: $d"
+done
+for d in "$USER_OLLAMA_DIR" /root/.ollama;do
+  if sudo test -d "$d";then
+    ok "Private folder exists: $d"
+  else
+    skip "Private folder missing: $d"
+    continue
+  fi
+  mode="$(sudo stat -c '%a' "$d" 2>/dev/null||true)"
+  group="$(sudo stat -c '%G' "$d" 2>/dev/null||true)"
+  case "$mode" in
+    2750|750) ok "Private folder mode acceptable: $d -> $mode";;
+    *) bad "Private folder mode too open or unexpected: $d -> $mode";;
+  esac
+  [ "$group" = "$OLLAMA_GROUP" ]&&ok "Private folder group: $d -> $group"||warn "Private folder group: $d -> $group"
+done
+if sudo find /srv/ollama /usr/share/ollama "$USER_OLLAMA_DIR" /root/.ollama -perm -0002 -print -quit 2>/dev/null|grep -q .;then
+  bad "World-writable Ollama path found"
+  sudo find /srv/ollama /usr/share/ollama "$USER_OLLAMA_DIR" /root/.ollama -perm -0002 -print 2>/dev/null|sed 's/^/[INFO] /'
+else
+  ok "World-writable Ollama paths: none"
+fi
+if sudo find /srv/ollama /usr/share/ollama -type d ! -perm -2000 -print -quit 2>/dev/null|grep -q .;then
+  bad "Shared Ollama directory missing setgid bit"
+  sudo find /srv/ollama /usr/share/ollama -type d ! -perm -2000 -print 2>/dev/null|head -20|sed 's/^/[INFO] /'
+else
+  ok "Shared Ollama directories have setgid inheritance"
+fi
+if sudo find /srv/ollama /usr/share/ollama -type d -perm -0002 -print -quit 2>/dev/null|grep -q .;then
+  bad "Shared directory writable by other found"
+else
+  ok "Shared directories are not writable by other"
+fi
+if sudo find /srv/ollama /usr/share/ollama -type f -perm -0002 -print -quit 2>/dev/null|grep -q .;then
+  bad "Shared file writable by other found"
+else
+  ok "Shared files are not writable by other"
+fi
+if sudo find "$USER_OLLAMA_DIR" /root/.ollama -type d -perm -0007 -print -quit 2>/dev/null|grep -q .;then
+  bad "Private Ollama directory grants access to other"
+else
+  ok "Private Ollama directories block other access"
+fi
+if sudo find "$USER_OLLAMA_DIR" /root/.ollama -type f -perm -0007 -print -quit 2>/dev/null|grep -q .;then
+  bad "Private Ollama file grants access to other"
+else
+  ok "Private Ollama files block other access"
+fi
+manual_test_dir="/srv/ollama/models/.verify-manual-cross-write"
+service_test_dir="/srv/ollama/models/.verify-service-cross-write"
+sudo rm -rf "$manual_test_dir" "$service_test_dir"
+mkdir -p "$manual_test_dir" 2>/dev/null
+touch "$manual_test_dir/manual-created-file" 2>/dev/null
+if sudo -u "$SVC_USER" sh -c "echo service-write >> '$manual_test_dir/manual-created-file'" 2>/dev/null;then
+  ok "Service can write manual-created file"
+else
+  bad "Service cannot write manual-created file"
+fi
+sudo -u "$SVC_USER" mkdir -p "$service_test_dir" 2>/dev/null
+sudo -u "$SVC_USER" touch "$service_test_dir/service-created-file" 2>/dev/null
+if echo manual-write >> "$service_test_dir/service-created-file" 2>/dev/null;then
+  ok "Manual user can write service-created file"
+else
+  bad "Manual user cannot write service-created file"
+fi
+if id nobody >/dev/null 2>&1;then
+  if sudo -u nobody sh -c "touch /srv/ollama/models/.verify-nobody-write" 2>/dev/null;then
+    bad "Unintended user nobody can write to /srv/ollama/models"
+    sudo rm -f /srv/ollama/models/.verify-nobody-write
+  else
+    ok "Unintended user nobody write blocked"
+  fi
+else
+  skip "nobody user not available"
+fi
+sudo rm -rf "$manual_test_dir" "$service_test_dir"
+if ollama list >/tmp/ollama-safe-permission-list.log 2>&1;then
+  ok "ollama list: OK"
+  tail -n +1 /tmp/ollama-safe-permission-list.log|sed 's/^/[INFO] /'
+else
+  bad "ollama list: FAIL"
+  tail -n 12 /tmp/ollama-safe-permission-list.log|sed 's/^/[INFO] /'
+fi
+rm -f /tmp/ollama-safe-permission-list.log
+)
+box "Ollama Permission Safety Results" "${VERIFY_LINES[@]}"
+if printf "%s\n" "${VERIFY_LINES[@]}"|grep -q '^\[BAD\]';then
+  box "Result" \
+  "One or more safety checks failed." \
+  "Review the BAD lines above." \
+  "Do not publish this permission model until corrected."
+  exit 1
+else
+  box "Result" \
+  "Permission safety checks passed." \
+  "No world-writable Ollama paths were found." \
+  "Only the service user, local user, and ollama group have write access."
+fi
+box "Ollama Data Paths" \
+"/srv/ollama" \
+"/srv/ollama/models" \
+"/usr/share/ollama" \
+"/usr/share/ollama/.ollama" \
+"$HOME/.ollama" \
+"/root/.ollama" \
+"Shared paths are not world-writable." \
+"Other local users are not granted write access."
+box "Old Duplicate Model Paths" \
+"/usr/share/ollama/.ollama/models" \
+"$HOME/.ollama/models" \
+"/root/.ollama/models" \
+"Only remove old model paths after the unified path is verified."
