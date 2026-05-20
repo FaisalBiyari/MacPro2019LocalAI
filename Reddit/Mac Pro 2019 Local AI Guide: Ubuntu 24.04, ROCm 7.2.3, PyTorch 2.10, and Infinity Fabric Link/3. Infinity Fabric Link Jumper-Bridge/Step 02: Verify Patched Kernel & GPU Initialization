@@ -1,0 +1,321 @@
+# IFLB Final Post-Reboot Verification
+
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+SOURCE_PKG="linux-hwe-6.17"
+ABI_NUM="2019"
+LOCAL_SUFFIX="macpro2019localai"
+FLAVOUR="generic"
+EXPECTED_BASEVER="6.17.0"
+KREL="${EXPECTED_BASEVER}-${ABI_NUM}-${FLAVOUR}"
+HDRBASE="${EXPECTED_BASEVER}-${ABI_NUM}"
+sudo -v 2>/dev/null || true
+ubuntu_deb_src_ready() {
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+paths = [Path("/etc/apt/sources.list")]
+paths += sorted(Path("/etc/apt/sources.list.d").glob("*.list"))
+paths += sorted(Path("/etc/apt/sources.list.d").glob("*.sources"))
+archive = False
+security = False
+for p in paths:
+    try:
+        text = p.read_text(errors="ignore")
+    except Exception:
+        continue
+    if p.suffix == ".list":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("deb-src"):
+                continue
+            if "archive.ubuntu.com/ubuntu" in line and re.search(r"\bnoble\b", line):
+                archive = True
+            if "security.ubuntu.com/ubuntu" in line and re.search(r"\bnoble-security\b", line):
+                security = True
+        continue
+    for block in re.split(r"\n\s*\n", text):
+        if not re.search(r"(?mi)^Types:\s*.*\bdeb-src\b", block):
+            continue
+        uris = " ".join(re.findall(r"(?mi)^URIs:\s*(.*)", block))
+        suites = " ".join(re.findall(r"(?mi)^Suites:\s*(.*)", block))
+        if "archive.ubuntu.com/ubuntu" in uris and re.search(r"\bnoble\b", suites):
+            archive = True
+        if "security.ubuntu.com/ubuntu" in uris and re.search(r"\bnoble-security\b", suites):
+            security = True
+sys.exit(0 if archive and security else 1)
+PY
+}
+latest_workspace() {
+  if [ -n "${IFLB_WORKSPACE:-}" ]&&[ -d "$IFLB_WORKSPACE" ];then
+    printf "%s\n" "$IFLB_WORKSPACE"
+    return 0
+  fi
+
+  while IFS= read -r d;do
+    core_count="$(
+      find "$d" -maxdepth 1 -type f \
+        \( -name "linux-hwe-6.17-headers-${HDRBASE}_*.deb" \
+        -o -name "linux-headers-${KREL}_*.deb" \
+        -o -name "linux-image-unsigned-${KREL}_*.deb" \
+        -o -name "linux-modules-${KREL}_*.deb" \
+        -o -name "linux-modules-extra-${KREL}_*.deb" \) \
+        2>/dev/null | wc -l
+    )"
+    if [ "$core_count" -ge 5 ] 2>/dev/null;then
+      printf "%s\n" "$d"
+      return 0
+    fi
+  done < <(
+    find "$HOME" -maxdepth 1 -type d -name 'iflb-kernel-*' -printf '%T@ %p\n' 2>/dev/null |
+    sort -nr |
+    sed 's/^[^ ]* //'
+  )
+
+  while IFS= read -r d;do
+    if [ -s "$d/build-last-rc.txt" ]||find "$d" -maxdepth 1 -type f -name "build-${KREL}-*.log" -print -quit 2>/dev/null|grep -q .;then
+      printf "%s\n" "$d"
+      return 0
+    fi
+  done < <(
+    find "$HOME" -maxdepth 1 -type d -name 'iflb-kernel-*' -printf '%T@ %p\n' 2>/dev/null |
+    sort -nr |
+    sed 's/^[^ ]* //'
+  )
+
+  find "$HOME" -maxdepth 1 -type d -name 'iflb-kernel-*' -printf '%T@ %p\n' 2>/dev/null |
+  sort -nr |
+  head -n 1 |
+  sed 's/^[^ ]* //'
+}
+
+latest_source_tree() {
+  [ -n "${BASE:-}" ]||return 1
+  find "$BASE" -maxdepth 1 -type d -name "${SOURCE_PKG}-*" 2>/dev/null|sort|head -n 1
+}
+pkg_ok(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null|grep -q "install ok installed"; }
+banner "IFLB Final Post-Reboot Verification"
+BASE="$(latest_workspace)"
+SRC="$(latest_source_tree)"
+RUNNING_KERNEL="$(uname -r 2>/dev/null||echo unknown)"
+BUILD_LOG=""
+if [ -n "$BASE" ];then
+  BUILD_LOG="$(find "$BASE" -maxdepth 1 -type f -name "build-${KREL}-*.log" 2>/dev/null|sort|tail -n 1)"
+fi
+mapfile -t STEP01_LINES < <(
+missing_tools=()
+for c in gcc make fakeroot dpkg-parsechangelog git patch zstd;do command -v "$c" >/dev/null 2>&1||missing_tools+=("$c");done
+if [ -r /etc/os-release ]&&grep -q '^ID=ubuntu' /etc/os-release;then ok "Ubuntu packaging environment detected";else bad "Ubuntu packaging environment not detected";fi
+if ubuntu_deb_src_ready;then ok "Ubuntu deb-src repositories: enabled";else bad "Ubuntu deb-src repositories: missing";fi
+if [ -n "$BASE" ]&&[ -d "$BASE" ];then ok "Latest workspace: $BASE";else bad "IFLB workspace not found";fi
+if [ -n "$SRC" ]&&[ -d "$SRC" ];then ok "Kernel source tree: $SRC";else bad "Kernel source tree missing";fi
+if [ "${#missing_tools[@]}" -eq 0 ];then ok "Build tools: available";else bad "Missing build tools: ${missing_tools[*]}";fi
+if [ -n "$SRC" ]&&[ -r "$SRC/debian.hwe-6.17/changelog" ];then ok "Kernel changelog: readable";else bad "Kernel changelog: missing";fi
+if [ -n "$SRC" ]&&[ -x "$SRC/debian/rules" ];then ok "debian/rules: executable";else bad "debian/rules: not executable";fi
+)
+box "Step 01 Source / Build Environment" "${STEP01_LINES[@]}"
+mapfile -t STEP02_LINES < <(
+if [ -z "$SRC" ]||[ ! -d "$SRC" ];then
+  bad "Kernel source tree unavailable"
+else
+  cd "$SRC" || exit 0
+  if grep -q "LinuxAI IFLB" drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c 2>/dev/null;then ok "gmc_v10_0.c patch marker: present";else bad "gmc_v10_0.c patch marker: missing";fi
+  if grep -q "adev->gmc.xgmi.supported = true;" drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c 2>/dev/null;then ok "Sienna Cichlid XGMI enablement: present";else bad "Sienna Cichlid XGMI enablement: missing";fi
+  if grep -q "Populate fb_start/fb_end here" drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c 2>/dev/null;then ok "fb_start/fb_end hive fix: present";else bad "fb_start/fb_end hive fix: missing";fi
+  if grep -q "static int gfxhub_v2_1_get_xgmi_info" drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c 2>/dev/null;then ok "gfxhub XGMI info function: present";else bad "gfxhub XGMI info function: missing";fi
+  if grep -q "\\.get_xgmi_info = gfxhub_v2_1_get_xgmi_info," drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c 2>/dev/null;then ok "gfxhub vtable hook: present";else bad "gfxhub vtable hook: missing";fi
+fi
+)
+box "Step 02 Patch Verification" "${STEP02_LINES[@]}"
+mapfile -t STEP03_LINES < <(
+if [ -z "$SRC" ]||[ ! -d "$SRC" ];then
+  bad "Kernel source tree unavailable"
+else
+  current_version="$(dpkg-parsechangelog -l "$SRC/debian.hwe-6.17/changelog" -S Version 2>/dev/null||true)"
+  image_version="$(dpkg-query -W -f='${Version}' "linux-image-unsigned-${KREL}" 2>/dev/null||true)"
+  if printf "%s\n" "$current_version"|grep -q "+${LOCAL_SUFFIX}$";then ok "Source package suffix: +${LOCAL_SUFFIX}";else bad "Source package suffix missing: ${current_version:-unknown}";fi
+  if printf "%s\n" "$current_version"|grep -q "^${EXPECTED_BASEVER}-${ABI_NUM}\.";then ok "Source ABI: ${ABI_NUM}";else bad "Source ABI mismatch: ${current_version:-unknown}";fi
+  if printf "%s\n" "$image_version"|grep -q "+${LOCAL_SUFFIX}$";then ok "Installed image package suffix: +${LOCAL_SUFFIX}";else bad "Installed image package suffix missing: ${image_version:-not installed}";fi
+fi
+DRYRUN="${BASE:-}/debian-rules-dryrun-after-abi.txt"
+if [ -s "$DRYRUN" ];then
+  ok "ABI dry-run file: $DRYRUN"
+  if grep -q "$KREL" "$DRYRUN";then ok "Dry-run kernel release: $KREL";else bad "Dry-run kernel release missing: $KREL";fi
+  if grep -q "${EXPECTED_BASEVER}-29-${FLAVOUR}" "$DRYRUN";then bad "Stock ABI still appears in dry-run";else ok "Stock ABI replaced";fi
+  if grep -q "CFLAGS_MODULE=\"-DPKG_ABI=${ABI_NUM}\"" "$DRYRUN";then ok "Numeric ABI verification: $ABI_NUM";else bad "Numeric ABI verification failed";fi
+else
+  warn "ABI dry-run file not found"
+fi
+)
+box "Step 03 ABI / Version Verification" "${STEP03_LINES[@]}"
+mapfile -t STEP04_LINES < <(
+mapfile -t CORE_PKGS < <(
+  if [ -n "$BASE" ];then
+    find "$BASE" -maxdepth 1 -type f \
+      \( -name "linux-hwe-6.17-headers-${HDRBASE}_*.deb" \
+      -o -name "linux-headers-${KREL}_*.deb" \
+      -o -name "linux-image-unsigned-${KREL}_*.deb" \
+      -o -name "linux-modules-${KREL}_*.deb" \
+      -o -name "linux-modules-extra-${KREL}_*.deb" \) \
+      | sort
+  fi
+)
+if [ -s "$BUILD_LOG" ];then ok "Build log: $BUILD_LOG";else warn "Build log missing or empty";fi
+if [ -n "$BASE" ]&&[ -s "$BASE/build-last-rc.txt" ];then
+  BUILD_RC="$(cat "$BASE/build-last-rc.txt" 2>/dev/null||echo unknown)"
+  if [ "$BUILD_RC" = "0" ];then ok "Build return code: 0";else bad "Build return code: $BUILD_RC";fi
+else
+  warn "Build return code file: not found"
+fi
+if [ "${#CORE_PKGS[@]}" -eq 5 ];then ok "Core package count: ${#CORE_PKGS[@]} / 5";else bad "Core package count: ${#CORE_PKGS[@]} / 5";fi
+for pkg in "${CORE_PKGS[@]}";do
+  if [ -s "$pkg" ];then ok "Built package: $(basename "$pkg")";else bad "Built package missing: $(basename "$pkg")";fi
+done
+)
+box "Step 04 Build Artifact Verification" "${STEP04_LINES[@]}"
+mapfile -t STEP05_LINES < <(
+pkg_names=(
+  "linux-hwe-6.17-headers-${HDRBASE}"
+  "linux-headers-${KREL}"
+  "linux-image-unsigned-${KREL}"
+  "linux-modules-${KREL}"
+  "linux-modules-extra-${KREL}"
+)
+installed_count=0
+version_ok_count=0
+for p in "${pkg_names[@]}";do
+  rec="$(dpkg-query -W -f='${db:Status-Abbrev}|${Version}\n' "$p" 2>/dev/null||true)"
+  status="${rec%%|*}"
+  version="${rec#*|}"
+  if [ "${status:1:1}" = "i" ];then
+    installed_count=$((installed_count+1))
+    if [[ "$version" == *"+${LOCAL_SUFFIX}" ]];then
+      version_ok_count=$((version_ok_count+1))
+      ok "Installed package: $p"
+      ok "Package version: $version"
+    else
+      warn "Installed package: $p"
+      warn "Unexpected version: ${version:-unknown}"
+    fi
+  else
+    bad "Missing package: $p"
+  fi
+done
+if [ "$installed_count" -ge 5 ];then
+  ok "Custom package set installed: $installed_count / 5"
+else
+  bad "Custom package set installed: $installed_count / 5"
+fi
+if [ "$version_ok_count" -ge 5 ];then
+  ok "Custom package versions: $version_ok_count / 5"
+else
+  bad "Custom package versions: $version_ok_count / 5"
+fi
+if [ -e "/boot/vmlinuz-${KREL}" ];then ok "Kernel image: /boot/vmlinuz-${KREL}";else bad "Kernel image missing";fi
+if [ -e "/boot/initrd.img-${KREL}" ];then ok "Initramfs: /boot/initrd.img-${KREL}";else bad "Initramfs missing";fi
+if [ -d "/lib/modules/${KREL}" ];then ok "Module directory: /lib/modules/${KREL}";else bad "Module directory missing";fi
+if grep -F "Ubuntu, with Linux ${KREL}" /boot/grub/grub.cfg >/dev/null 2>&1||sudo grep -F "Ubuntu, with Linux ${KREL}" /boot/grub/grub.cfg >/dev/null 2>&1;then
+  ok "GRUB entry present: ${KREL}"
+else
+  bad "GRUB entry missing: ${KREL}"
+fi
+)
+box "Step 05 Installation Verification" "${STEP05_LINES[@]}"
+mapfile -t STEP06_LINES < <(
+held_count="$(apt-mark showhold 2>/dev/null|grep -Ec "^(linux-image-unsigned|linux-modules|linux-modules-extra|linux-headers)-${KREL}$|^linux-hwe-6.17-headers-${HDRBASE}$"||true)"
+if [ "$held_count" -ge 5 ];then ok "Held custom packages: $held_count";else bad "Held custom packages: $held_count";fi
+if [ -f /etc/default/grub.d/99-iflb-kernel-default.cfg ];then ok "Persistent GRUB default config: present";else bad "Persistent GRUB default config: missing";fi
+saved_entry="$(sudo grub-editenv list 2>/dev/null|grep '^saved_entry='||true)"
+if printf "%s\n" "$saved_entry"|grep -F "Ubuntu, with Linux ${KREL}" >/dev/null 2>&1;then ok "GRUB saved default: ${KREL}";else warn "GRUB saved default: ${saved_entry:-not shown}";fi
+if [ "$RUNNING_KERNEL" = "$KREL" ];then
+  ok "Running patched kernel: $RUNNING_KERNEL"
+else
+  bad "Running kernel: $RUNNING_KERNEL"
+  warn "Expected patched kernel: $KREL"
+fi
+)
+box "Step 06 Boot / Hold Verification" "${STEP06_LINES[@]}"
+mapfile -t RUNTIME_LINES < <(
+mapfile -t GPU_BDFS < <(
+  for d in /sys/bus/pci/devices/*;do
+    [ -e "$d" ]||continue
+    [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ]||continue
+    c="$(cat "$d/class" 2>/dev/null||true)"
+    case "$c" in 0x030000|0x038000) basename "$d";; esac
+  done|sort
+)
+GPU_COUNT="${#GPU_BDFS[@]}"
+BIND_OK=0
+if [ "$GPU_COUNT" -gt 0 ];then
+  ok "AMD display GPUs detected: $GPU_COUNT"
+else
+  bad "AMD display GPUs detected: 0"
+fi
+for bdf in "${GPU_BDFS[@]}";do
+  if [ -L "/sys/bus/pci/devices/$bdf/driver" ];then
+    drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+  else
+    drv="none"
+  fi
+  if [ "$drv" = "amdgpu" ];then
+    BIND_OK=$((BIND_OK+1))
+    ok "$bdf driver: amdgpu"
+  else
+    bad "$bdf driver: $drv"
+  fi
+done
+if [ "$GPU_COUNT" -gt 0 ]&&[ "$BIND_OK" -eq "$GPU_COUNT" ];then
+  ok "All detected AMD display GPUs bound to amdgpu: $BIND_OK / $GPU_COUNT"
+else
+  bad "AMDGPU binding: $BIND_OK / $GPU_COUNT"
+fi
+if grep -q '^amdgpu ' /proc/modules;then ok "amdgpu module loaded: YES";else bad "amdgpu module loaded: NO";fi
+if command -v modinfo >/dev/null 2>&1&&modinfo amdgpu 2>/dev/null|grep -q "/lib/modules/${KREL}/";then
+  ok "amdgpu module path matches patched kernel"
+else
+  warn "amdgpu module path not confirmed"
+fi
+if sudo -n true 2>/dev/null;then
+  XGMI_COUNT="$(sudo dmesg 2>/dev/null|grep -ciE 'XGMI|xgmi|hive')"
+else
+  XGMI_COUNT="$(dmesg 2>/dev/null|grep -ciE 'XGMI|xgmi|hive')"
+fi
+if [ "$XGMI_COUNT" -gt 0 ] 2>/dev/null;then
+  ok "Kernel log XGMI/hive references: $XGMI_COUNT"
+else
+  warn "Kernel log XGMI/hive references: 0"
+  info "This can be normal if the bridge is absent or dmesg is restricted."
+fi
+)
+box "Runtime GPU / xGMI Verification" "${RUNTIME_LINES[@]}"
+mapfile -t FINAL_LINES < <(
+FAIL_COUNT=0
+WARN_COUNT=0
+for block in \
+  "${STEP01_LINES[@]}" "${STEP02_LINES[@]}" "${STEP03_LINES[@]}" \
+  "${STEP04_LINES[@]}" "${STEP05_LINES[@]}" "${STEP06_LINES[@]}" "${RUNTIME_LINES[@]}";do
+  case "$block" in
+    "[BAD]"*) FAIL_COUNT=$((FAIL_COUNT+1)) ;;
+    "[WARN]"*) WARN_COUNT=$((WARN_COUNT+1)) ;;
+  esac
+done
+if [ "$RUNNING_KERNEL" = "$KREL" ];then ok "Patched kernel is currently running";else bad "Patched kernel is not currently running";fi
+if [ "$FAIL_COUNT" -eq 0 ];then
+  ok "Final result: PASS"
+else
+  bad "Final result: FAIL"
+fi
+info "BAD count: $FAIL_COUNT"
+info "WARN count: $WARN_COUNT"
+info "Expected kernel: $KREL"
+info "Current kernel: $RUNNING_KERNEL"
+)
+box "Final IFLB Verification Result" "${FINAL_LINES[@]}"
