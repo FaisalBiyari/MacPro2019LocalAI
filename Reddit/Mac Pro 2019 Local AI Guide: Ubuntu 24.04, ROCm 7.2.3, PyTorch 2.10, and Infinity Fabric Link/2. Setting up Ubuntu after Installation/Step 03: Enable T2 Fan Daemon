@@ -1,0 +1,47 @@
+banner(){ m="=============== $1 ===============";b=$(printf "%${#m}s"|tr ' ' '=');echo;echo "$b";echo "$m";echo "$b";echo;}
+box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+banner "Step 03: Enable T2 Fan Daemon"
+sudo systemctl enable --now t2fanrd
+sudo systemctl restart t2fanrd
+mapfile -t PHASE03_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+info(){ echo "[INFO] $*"; }
+enabled="$(systemctl is-enabled t2fanrd 2>/dev/null||true)"
+active="$(systemctl is-active t2fanrd 2>/dev/null||true)"
+failed="$(systemctl is-failed t2fanrd 2>/dev/null||true)"
+pid="$(systemctl show -p MainPID --value t2fanrd 2>/dev/null||true)"
+if systemctl cat t2fanrd >/dev/null 2>&1;then
+  ok "t2fanrd service file: present"
+else
+  bad "t2fanrd service file: missing"
+fi
+if [ "$enabled" = "enabled" ];then
+  ok "t2fanrd enabled: yes"
+else
+  bad "t2fanrd enabled: ${enabled:-unknown}"
+fi
+if [ "$active" = "active" ];then
+  ok "t2fanrd active: yes"
+else
+  bad "t2fanrd active: ${active:-unknown}"
+fi
+if [ "$failed" = "failed" ];then
+  bad "t2fanrd failed state: failed"
+else
+  ok "t2fanrd failed state: clear"
+fi
+if [ -n "$pid" ]&&[ "$pid" != "0" ];then
+  ok "t2fanrd MainPID: $pid"
+else
+  warn "t2fanrd MainPID: not detected"
+fi
+if [ -f /etc/t2fand.conf ];then
+  ok "t2fand config: /etc/t2fand.conf"
+else
+  warn "t2fand config: not found"
+fi
+info "Fan daemon setup complete."
+)
+box "Phase 03 Checks" "${PHASE03_LINES[@]}"
