@@ -1,5 +1,3 @@
-# ReBAR MacPro7,1 Duo GPUs using nbritton's method
-
 bash <<'LINUXAI_DYNAMIC_NBRITTON_INSTALL_V2'
 set -Eeuo pipefail
 TITLE="INSTALL DYNAMIC NBRITTON-STYLE BAR RESIZE METHOD"
