@@ -1,0 +1,1154 @@
+
+export MPX_REBAR_INSTALL_CONFIRMED=1
+export MPX_REBAR_KERNEL_7_PCI_FIX_VERIFIED=1
+
+bash <<'APPLE_DUO_REBAR_INSTALL_V3'
+set -Eeuo pipefail
+TITLE="INSTALL DYNAMIC NBRITTON-STYLE BAR RESIZE METHOD"
+LINE="=============== ${TITLE} ==============="
+BORDER="$(printf "%*s" "${#LINE}" "" | tr " " "=")"
+echo "$BORDER"
+echo "$LINE"
+echo "$BORDER"
+if [ "${MPX_REBAR_INSTALL_CONFIRMED:-0}" != "1" ]; then
+  echo "PREVIEW ONLY: no installation, no PCI writes, no driver changes."
+  echo "System: $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+  echo "Kernel: $(uname -r)"
+  echo "AMD display devices detected:"
+  for dev in /sys/bus/pci/devices/*; do
+    [ -e "$dev" ] || continue
+    [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1002" ] || continue
+    case "$(cat "$dev/class" 2>/dev/null)" in
+      0x030000|0x038000) echo "  $(basename "$dev")" ;;
+    esac
+  done
+  if command -v lspci >/dev/null 2>&1; then
+    echo "PCIe tree (read-only):"
+    lspci -t
+  fi
+  echo "Review the README and explicitly opt in before installing."
+  exit 0
+fi
+KEEPALIVE_PID=""
+cleanup() {
+  if [ -n "${KEEPALIVE_PID:-}" ]; then
+    kill "$KEEPALIVE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+echo
+echo "Acquire sudo once and keep it alive:"
+sudo -v
+while true; do
+  sudo -n true 2>/dev/null || true
+  sleep 30
+done &
+KEEPALIVE_PID="$!"
+echo
+echo "Kernel/boot preflight (no changes yet):"
+KREL="$(uname -r)"
+KSIG="$(cat /proc/version_signature 2>/dev/null || uname -v)"
+case "$KREL" in
+  7.0.*)
+    if [ "${MPX_REBAR_KERNEL_7_PCI_FIX_VERIFIED:-0}" != "1" ]; then
+      echo "ERROR: Linux 7.0 PCI bridge alignment fix is not verified." >&2
+      echo "Inspect the patch in the actual running kernel source." >&2
+      exit 1
+    fi
+    ;;
+  6.*) echo "WARNING: Linux 6.x; hardware and PCI topology still require validation." ;;
+  *) echo "ERROR: Kernel family not evaluated by this release candidate: $KREL" >&2; exit 1 ;;
+esac
+if [ ! -f /etc/default/grub ] || [ ! -f /boot/grub/grub.cfg ] || ! command -v update-grub >/dev/null 2>&1; then
+  echo "ERROR: This guide requires an active GRUB boot setup." >&2
+  echo "For OpenCore/rEFInd direct boot, configure pci=realloc separately." >&2
+  exit 1
+fi
+if [ "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" != "MacPro7,1" ]; then
+  echo "ERROR: This installer is restricted to MacPro7,1." >&2
+  exit 1
+fi
+# Root-bus rescan paths will be discovered and validated at runtime.
+# Detect the generator of the current on-disk kernel initrd, not merely which
+# utilities are installed. Ubuntu 26.04 can expose BOTH commands.
+INITRD_CURRENT="/boot/initrd.img-$KREL"
+if [ ! -s "$INITRD_CURRENT" ]; then
+  echo "ERROR: Current-kernel initrd missing or empty: $INITRD_CURRENT" >&2
+  exit 1
+fi
+IMAGE_IS_DRACUT=0
+IMAGE_IS_INITRAMFS_TOOLS=0
+if command -v lsinitrd >/dev/null 2>&1; then
+  for manifest_path in /usr/lib/dracut/modules.txt /lib/dracut/modules.txt; do
+    if manifest="$(sudo lsinitrd -f "$manifest_path" "$INITRD_CURRENT" 2>/dev/null)" && [ -n "${manifest//[[:space:]]/}" ]; then
+      IMAGE_IS_DRACUT=1
+      break
+    fi
+  done
+fi
+if command -v lsinitramfs >/dev/null 2>&1; then
+  # scripts/functions is part of the classic initramfs-tools boot image.
+  image_paths="$(sudo lsinitramfs "$INITRD_CURRENT" 2>/dev/null || true)"
+  if grep -Eq '^\.?/?scripts/functions$' <<< "$image_paths"; then
+    IMAGE_IS_INITRAMFS_TOOLS=1
+  fi
+fi
+if [ "$IMAGE_IS_DRACUT" = 1 ] && [ "$IMAGE_IS_INITRAMFS_TOOLS" = 0 ] && command -v dracut >/dev/null 2>&1; then
+  INITRAMFS_BACKEND=dracut
+elif [ "$IMAGE_IS_INITRAMFS_TOOLS" = 1 ] && [ "$IMAGE_IS_DRACUT" = 0 ] && command -v update-initramfs >/dev/null 2>&1; then
+  INITRAMFS_BACKEND=initramfs-tools
+else
+  echo "ERROR: Unable to uniquely identify a usable initramfs generator for $INITRD_CURRENT." >&2
+  echo "Detected image markers: Dracut=$IMAGE_IS_DRACUT initramfs-tools=$IMAGE_IS_INITRAMFS_TOOLS" >&2
+  echo "No boot files or GPU settings were changed. Inspect this image and your GRUB entry manually." >&2
+  exit 1
+fi
+echo "Selected initramfs backend: $INITRAMFS_BACKEND (identified from $INITRD_CURRENT)"
+if systemctl list-unit-files resize-amdgpu-bars.service --no-legend 2>/dev/null | grep -q resize-amdgpu-bars; then
+  echo "ERROR: Upstream resize-amdgpu-bars service already installed; do not mix installers." >&2
+  exit 1
+fi
+echo "Validate no existing ReBAR management is configured:"
+for existing in \
+  /usr/local/sbin/apple_duo_resize_bars.sh \
+  /etc/systemd/system/apple-duo-rebar.service \
+  /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf \
+  /etc/default/apple-duo-rebar \
+  /etc/default/grub.d/95-apple-duo-rebar.cfg \
+  /etc/systemd/system/resize-gpu-bars.service \
+  /etc/systemd/system/amdgpu-bar-resize.service \
+  /usr/local/sbin/resize_gpu_bars.sh \
+  /etc/modprobe.d/amdgpu-blacklist.conf; do
+  if [ -e "$existing" ]; then
+    echo "ERROR: Existing ReBAR management file: $existing" >&2
+    echo "Refusing to overwrite or mix implementations. Review manually." >&2
+    exit 1
+  fi
+done
+echo
+echo "Install required packages (preserve existing initramfs backend):"
+sudo DEBIAN_FRONTEND=noninteractive apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pciutils python3 kmod util-linux
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+BACKUP="$HOME/apple-duo-rebar-backup-$STAMP"
+mkdir -p "$BACKUP"
+echo
+echo "Backup existing files:"
+sudo cp -a /etc/default/grub "$BACKUP/grub.before" 2>/dev/null || true
+sudo cp -a /usr/local/sbin/apple_duo_resize_bars.sh "$BACKUP/resize_gpu_bars.sh.before" 2>/dev/null || true
+sudo cp -a /etc/systemd/system/apple-duo-rebar.service "$BACKUP/apple-duo-rebar.service.before" 2>/dev/null || true
+sudo cp -a /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf "$BACKUP/amdgpu-blacklist.conf.before" 2>/dev/null || true
+sudo cp -a /etc/initramfs-tools/hooks/apple-duo-amdgpu-blacklist "$BACKUP/apple-duo-amdgpu-blacklist.before" 2>/dev/null || true
+sudo cp -a /etc/dracut.conf.d/95-apple-duo-amdgpu-rebar.conf "$BACKUP/95-apple-duo-amdgpu-rebar.conf.before" 2>/dev/null || true
+sudo cp -a /etc/default/apple-duo-rebar "$BACKUP/resize-gpu-bars.default.before" 2>/dev/null || true
+# Keep the current bootable image available for manual rollback.
+if [ -f "/boot/initrd.img-$KREL" ]; then
+  sudo cp -a "/boot/initrd.img-$KREL" "$BACKUP/initrd.img-$KREL.before"
+fi
+echo "$BACKUP"
+echo
+echo "Write runtime defaults:"
+sudo tee /etc/default/apple-duo-rebar >/dev/null <<'DEFAULTS_EOF'
+# Dynamic nbritton-style AMD BAR resize settings.
+#
+# Upper cap: 32 GiB (index 15). Actual target = largest BAR0 size
+# the individual GPU reports as supported, up to this cap.
+#
+# For 64 GiB GPUs, advanced users may set:
+#   MPX_REBAR_TARGET_REBAR_INDEX_MAX=16
+#
+# Safety defaults:
+#   - Restrict to MacPro7,1 by default.
+#   - Skip AMD GPUs behind Thunderbolt by default.
+#   - Select exactly two eligible GPUs per PCI root bridge.
+MPX_REBAR_TARGET_REBAR_INDEX_MAX=15
+MPX_REBAR_REQUIRE_MACPRO71=1
+MPX_REBAR_ALLOW_THUNDERBOLT_GPUS=0
+MPX_REBAR_EXPECT_GPU_COUNT=0
+DEFAULTS_EOF
+# Do not run a destructive rescan automatically after a kernel upgrade.
+printf 'MPX_REBAR_APPROVED_KERNEL_RELEASE=%s\n' "$KREL" | sudo tee -a /etc/default/apple-duo-rebar >/dev/null
+printf 'MPX_REBAR_APPROVED_KERNEL_SIGNATURE="%s"\n' "$KSIG" | sudo tee -a /etc/default/apple-duo-rebar >/dev/null
+echo
+echo "Write amdgpu blacklist:"
+sudo tee /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf >/dev/null <<'BLACKLIST_EOF'
+# Prevent amdgpu from autoloading before apple-duo-rebar.service runs.
+# The service explicitly loads amdgpu after direct ReBAR write + PCI remove/rescan.
+blacklist amdgpu
+BLACKLIST_EOF
+echo
+echo "Configure the detected initramfs backend: $INITRAMFS_BACKEND"
+if [ "$INITRAMFS_BACKEND" = dracut ]; then
+  sudo install -d -m 755 /etc/dracut.conf.d
+  sudo tee /etc/dracut.conf.d/95-apple-duo-amdgpu-rebar.conf >/dev/null <<'DRACUT_EOF'
+# Keep amdgpu out of the early Dracut image until BAR resize completes.
+omit_drivers+=" amdgpu "
+install_items+=" /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf "
+DRACUT_EOF
+else
+  sudo install -d -m 755 /etc/initramfs-tools/hooks
+  sudo tee /etc/initramfs-tools/hooks/apple-duo-amdgpu-blacklist >/dev/null <<'HOOK_EOF'
+#!/bin/sh
+set -e
+PREREQ=""
+prereqs()
+{
+  echo "$PREREQ"
+}
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+if [ -f /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf ]; then
+  mkdir -p "$DESTDIR/etc/modprobe.d"
+  cp -p /etc/modprobe.d/99-apple-duo-rebar-blacklist.conf "$DESTDIR/etc/modprobe.d/99-apple-duo-rebar-blacklist.conf"
+fi
+exit 0
+HOOK_EOF
+  sudo chmod 755 /etc/initramfs-tools/hooks/apple-duo-amdgpu-blacklist
+fi
+echo
+echo "Write dynamic resize script:"
+sudo tee /usr/local/sbin/apple_duo_resize_bars.sh >/dev/null <<'SCRIPT_EOF'
+#!/bin/bash
+set -euo pipefail
+GPU_BDFS=()
+TARGET_BDFS=()
+TARGET_INDEXES=()
+REBAR_CAP_OFFSETS=()
+REBAR_CTRL_OFFSETS=()
+AUDIO_BDFS=()
+TOP_BRIDGES=()
+BRIDGE_CHAIN_BDFS=()
+TARGET_INDEX_MAX="${MPX_REBAR_TARGET_REBAR_INDEX_MAX:-15}"
+REQUIRE_MACPRO71="${MPX_REBAR_REQUIRE_MACPRO71:-1}"
+ALLOW_THUNDERBOLT_GPUS="${MPX_REBAR_ALLOW_THUNDERBOLT_GPUS:-0}"
+EXPECT_GPU_COUNT="${MPX_REBAR_EXPECT_GPU_COUNT:-0}"
+APPROVED_KERNEL="${MPX_REBAR_APPROVED_KERNEL_RELEASE:-}"
+APPROVED_SIGNATURE="${MPX_REBAR_APPROVED_KERNEL_SIGNATURE:-}"
+log_info() { echo "[INFO] $*" >&2; }
+log_ok() { echo "[OK] $*" >&2; }
+log_warn() { echo "[WARN] $*" >&2; }
+log_err() { echo "[ERROR] $*" >&2; }
+uniq_add() {
+  local arr_name="$1"
+  local value="$2"
+  local current
+  eval "current=(\"\${${arr_name}[@]:-}\")"
+  for x in "${current[@]}"; do
+    [ "$x" = "$value" ] && return 0
+  done
+  eval "${arr_name}+=(\"\$value\")"
+}
+idx_to_bytes() {
+  local idx="$1"
+  echo $((1 << (idx + 20)))
+}
+idx_to_human() {
+  local idx="$1"
+  if ! [ "$idx" -ge 0 ] 2>/dev/null; then
+    echo "unknown"
+    return
+  fi
+  local bytes
+  bytes="$(idx_to_bytes "$idx")"
+  if [ "$bytes" -ge 1073741824 ]; then
+    echo "$((bytes / 1073741824)) GiB"
+  elif [ "$bytes" -ge 1048576 ]; then
+    echo "$((bytes / 1048576)) MiB"
+  else
+    echo "$((bytes / 1024)) KiB"
+  fi
+}
+is_amd_display_gpu() {
+  local dev="$1"
+  local vendor class
+  vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+  class="$(cat "$dev/class" 2>/dev/null || true)"
+  [ "$vendor" = "0x1002" ] || return 1
+  case "$class" in
+    0x030000|0x038000) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+is_amd_audio_function() {
+  local dev="$1"
+  local vendor class
+  vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+  class="$(cat "$dev/class" 2>/dev/null || true)"
+  [ "$vendor" = "0x1002" ] || return 1
+  [ "$class" = "0x040300" ] || return 1
+}
+find_rebar_cap_offset() {
+  local bdf="$1"
+  local off=256
+  local loops=0
+  while [ "$off" -ge 256 ] && [ "$off" -le 4092 ] && [ "$loops" -lt 64 ]; do
+    local off_hex hdr val cap_id next
+    off_hex="$(printf "%03x" "$off")"
+    hdr="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null || true)"
+    [ -n "$hdr" ] || return 1
+    val=$((16#$hdr))
+    cap_id=$((val & 0xffff))
+    next=$(((val >> 20) & 0xfff))
+    if [ "$cap_id" -eq 21 ]; then
+      printf "%d\n" "$off"
+      return 0
+    fi
+    [ "$next" -eq 0 ] && break
+    [ "$next" -eq "$off" ] && break
+    off="$next"
+    loops=$((loops + 1))
+  done
+  return 1
+}
+read_rebar_size_index_at_ctrl() {
+  local bdf="$1"
+  local ctrl_off="$2"
+  local off_hex ctrl_val
+  off_hex="$(printf "%03x" "$ctrl_off")"
+  ctrl_val="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null)" || {
+    echo "-1"
+    return
+  }
+  echo $(((16#$ctrl_val >> 8) & 0x3f))
+}
+write_rebar_size_index_at_ctrl() {
+  local bdf="$1"
+  local ctrl_off="$2"
+  local new_index="$3"
+  local off_hex ctrl_val current_int cleared new_val new_hex readback
+  off_hex="$(printf "%03x" "$ctrl_off")"
+  ctrl_val="$(setpci -s "$bdf" "${off_hex}.l" 2>/dev/null)" || return 1
+  current_int=$((16#$ctrl_val))
+  cleared=$((current_int & ~0x3f00))
+  new_val=$((cleared | (new_index << 8)))
+  new_hex="$(printf "%08x" "$new_val")"
+  setpci -s "$bdf" "${off_hex}.l=${new_hex}" 2>/dev/null || return 1
+  readback="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+  [ "$readback" = "$new_index" ]
+}
+read_resource0_resize_mask() {
+  local bdf="$1"
+  local f="/sys/bus/pci/devices/$bdf/resource0_resize"
+  local raw
+  [ -r "$f" ] || return 1
+  raw="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"
+  raw="${raw#0x}"
+  [ -n "$raw" ] || return 1
+  echo $((16#$raw))
+}
+highest_supported_index_le_max() {
+  local mask="$1"
+  local max_idx="$2"
+  local i
+  for ((i=max_idx; i>=0; i--)); do
+    if (( mask & (1 << i) )); then
+      echo "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+path_bdfs_for_device() {
+  local bdf="$1"
+  local path part
+  path="$(readlink -f "/sys/bus/pci/devices/$bdf" 2>/dev/null || true)"
+  [ -n "$path" ] || return 1
+  IFS='/' read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      ????\:??\:??.?)
+        echo "$part"
+        ;;
+    esac
+  done
+}
+device_is_bridge() {
+  local bdf="$1"
+  local class
+  class="$(cat "/sys/bus/pci/devices/$bdf/class" 2>/dev/null || true)"
+  case "$class" in
+    0x0604*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+find_top_bridge_for_gpu() {
+  local bdf="$1"
+  local bridges=()
+  local p bus chosen=""
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    if device_is_bridge "$p"; then
+      bridges+=("$p")
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+  [ "${#bridges[@]}" -gt 0 ] || return 1
+  for p in "${bridges[@]}"; do
+    bus="${p#*:}"
+    bus="${bus%%:*}"
+    if [ "$bus" != "00" ]; then
+      chosen="$p"
+      break
+    fi
+  done
+  [ -n "$chosen" ] || chosen="${bridges[0]}"
+  echo "$chosen"
+}
+add_bridge_chain_for_gpu() {
+  local bdf="$1"
+  local p
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    if device_is_bridge "$p"; then
+      uniq_add BRIDGE_CHAIN_BDFS "$p"
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+}
+is_under_thunderbolt() {
+  local bdf="$1"
+  local p vendor device
+  while read -r p; do
+    [ "$p" = "$bdf" ] && continue
+    vendor="$(cat "/sys/bus/pci/devices/$p/vendor" 2>/dev/null || true)"
+    device="$(cat "/sys/bus/pci/devices/$p/device" 2>/dev/null || true)"
+    if [ "$vendor" = "0x8086" ]; then
+      case "$device" in
+        0x15ea|0x15eb|0x15ec)
+          return 0
+          ;;
+      esac
+    fi
+  done < <(path_bdfs_for_device "$bdf")
+  return 1
+}
+discover_audio_for_gpu() {
+  local gpu="$1"
+  local slot="${gpu%.*}"
+  local dev bdf
+  for dev in /sys/bus/pci/devices/"$slot".*; do
+    [ -e "$dev" ] || continue
+    bdf="$(basename "$dev")"
+    if is_amd_audio_function "$dev"; then
+      uniq_add AUDIO_BDFS "$bdf"
+    fi
+  done
+}
+discover_targets() {
+  GPU_BDFS=()
+  TARGET_BDFS=()
+  TARGET_INDEXES=()
+  REBAR_CAP_OFFSETS=()
+  REBAR_CTRL_OFFSETS=()
+  AUDIO_BDFS=()
+  TOP_BRIDGES=()
+  BRIDGE_CHAIN_BDFS=()
+  local dev bdf mask target_idx cap_off ctrl_off top_bridge
+  while read -r dev; do
+    bdf="$(basename "$dev")"
+    GPU_BDFS+=("$bdf")
+    if [ "$ALLOW_THUNDERBOLT_GPUS" != "1" ] && is_under_thunderbolt "$bdf"; then
+      log_warn "Skipping $bdf because it appears to be behind Thunderbolt. Set MPX_REBAR_ALLOW_THUNDERBOLT_GPUS=1 to override."
+      continue
+    fi
+    if ! cap_off="$(find_rebar_cap_offset "$bdf")"; then
+      log_warn "Skipping $bdf: no ReBAR extended capability found."
+      continue
+    fi
+    if ! mask="$(read_resource0_resize_mask "$bdf")"; then
+      log_warn "Skipping $bdf: resource0_resize not readable for BAR0 capability discovery."
+      continue
+    fi
+    if ! target_idx="$(highest_supported_index_le_max "$mask" "$TARGET_INDEX_MAX")"; then
+      log_warn "Skipping $bdf: no supported BAR0 size at or below index $TARGET_INDEX_MAX."
+      continue
+    fi
+    if [ "$target_idx" -le 8 ]; then
+      log_warn "Skipping $bdf: largest allowed BAR0 size is only $(idx_to_human "$target_idx")."
+      continue
+    fi
+    ctrl_off=$((cap_off + 8))
+    if ! top_bridge="$(find_top_bridge_for_gpu "$bdf")"; then
+      log_warn "Skipping $bdf: could not identify removable top bridge."
+      continue
+    fi
+    TARGET_BDFS+=("$bdf")
+    TARGET_INDEXES+=("$target_idx")
+    REBAR_CAP_OFFSETS+=("$cap_off")
+    REBAR_CTRL_OFFSETS+=("$ctrl_off")
+    uniq_add TOP_BRIDGES "$top_bridge"
+    add_bridge_chain_for_gpu "$bdf"
+    discover_audio_for_gpu "$bdf"
+  done < <(for d in /sys/bus/pci/devices/*; do
+            [ -e "$d" ] || continue
+            if is_amd_display_gpu "$d"; then
+              echo "$d"
+            fi
+          done | sort)
+  select_duo_pairs
+}
+
+verify_gpu_only_subtree() {
+  # Never remove a PCI bridge with a NIC, storage, USB controller, or any
+  # non-GPU endpoint underneath it. Bridges themselves are permitted.
+  local root="$1" root_path dev bdf dev_path vendor class
+  root_path="$(readlink -f "/sys/bus/pci/devices/$root" 2>/dev/null)" || return 1
+  [ -n "$root_path" ] || return 1
+  for dev in /sys/bus/pci/devices/*; do
+    [ -e "$dev" ] || continue
+    dev_path="$(readlink -f "$dev" 2>/dev/null || true)"
+    case "$dev_path" in
+      "$root_path"/*)
+        bdf="$(basename "$dev")"
+        vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+        class="$(cat "$dev/class" 2>/dev/null || true)"
+        case "$class" in
+          0x0604*) continue ;;  # PCI-to-PCI bridges
+          0x030000|0x038000|0x040300)
+            [ "$vendor" = 0x1002 ] && continue ;;
+          0x058000)
+            # Switchtec management functions are ordinary endpoints, but
+            # they belong to the MPX PCIe switch itself. Permit ONLY the
+            # Microchip/Microsemi management function (11f8:class 0580),
+            # immediately below this root and paired with a bridge on .0.
+            # Never extend this exception to NICs, storage, USB, or NTBs.
+            if [ "$vendor" = 0x11f8 ] &&
+               [ "${dev_path%/*}" = "$root_path" ] &&
+               [[ "$bdf" =~ ^([[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2})\.[1-7]$ ]]; then
+              local switch_slot="${BASH_REMATCH[1]}"
+              local switch_bridge="${switch_slot}.0"
+              local switch_bridge_path
+              switch_bridge_path="$(readlink -f "/sys/bus/pci/devices/$switch_bridge" 2>/dev/null || true)"
+              if [ -n "$switch_bridge_path" ] &&
+                 [ "${switch_bridge_path%/*}" = "$root_path" ] &&
+                 device_is_bridge "$switch_bridge"; then
+                log_info "Allowing expected Switchtec management function $bdf under root $root (paired bridge $switch_bridge)."
+                continue
+              fi
+            fi
+            ;;
+        esac
+        log_err "Root $root also contains unrelated/unsupported endpoint $bdf (vendor=$vendor class=$class); skipping subtree."
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+select_duo_pairs() {
+  # A Duo candidate is precisely TWO eligible AMD display endpoints beneath
+  # a shared root-side PCIe bridge. Do not resize standalone GPU branches.
+  local -a cb=("${TARGET_BDFS[@]}") ci=("${TARGET_INDEXES[@]}")
+  local -a cc=("${REBAR_CAP_OFFSETS[@]}") ct=("${REBAR_CTRL_OFFSETS[@]}")
+  local -a roots=()
+  local root bdf member_root num_all num_candidate i
+  for bdf in "${cb[@]}"; do
+    root="$(find_top_bridge_for_gpu "$bdf" 2>/dev/null || true)"
+    [ -n "$root" ] && uniq_add roots "$root"
+  done
+  TARGET_BDFS=(); TARGET_INDEXES=(); REBAR_CAP_OFFSETS=(); REBAR_CTRL_OFFSETS=()
+  TOP_BRIDGES=(); BRIDGE_CHAIN_BDFS=(); AUDIO_BDFS=()
+  for root in "${roots[@]}"; do
+    num_all=0; num_candidate=0
+    for bdf in "${GPU_BDFS[@]}"; do
+      member_root="$(find_top_bridge_for_gpu "$bdf" 2>/dev/null || true)"
+      [ "$member_root" = "$root" ] && num_all=$((num_all + 1))
+    done
+    for bdf in "${cb[@]}"; do
+      member_root="$(find_top_bridge_for_gpu "$bdf" 2>/dev/null || true)"
+      [ "$member_root" = "$root" ] && num_candidate=$((num_candidate + 1))
+    done
+    if [ "$num_all" -ne 2 ] || [ "$num_candidate" -ne 2 ]; then
+      log_warn "Not selecting root $root: $num_all AMD display GPUs, $num_candidate eligible ReBAR targets (need exactly 2/2)."
+      continue
+    fi
+    if ! verify_gpu_only_subtree "$root"; then
+      log_warn "Not selecting root $root because its subtree contains other endpoints."
+      continue
+    fi
+    uniq_add TOP_BRIDGES "$root"
+    for ((i=0; i<${#cb[@]}; i++)); do
+      member_root="$(find_top_bridge_for_gpu "${cb[$i]}" 2>/dev/null || true)"
+      if [ "$member_root" = "$root" ]; then
+        TARGET_BDFS+=("${cb[$i]}")
+        TARGET_INDEXES+=("${ci[$i]}")
+        REBAR_CAP_OFFSETS+=("${cc[$i]}")
+        REBAR_CTRL_OFFSETS+=("${ct[$i]}")
+        add_bridge_chain_for_gpu "${cb[$i]}"
+        discover_audio_for_gpu "${cb[$i]}"
+      fi
+    done
+  done
+}
+verify_macpro() {
+  local product=""
+  product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  if [ "$REQUIRE_MACPRO71" = "1" ]; then
+    if [ "$product" != "MacPro7,1" ]; then
+      log_err "This installer is restricted to MacPro7,1 by default. Detected product_name='$product'."
+      log_err "Set MPX_REBAR_REQUIRE_MACPRO71=0 in /etc/default/apple-duo-rebar only if you know what you are doing."
+      exit 1
+    fi
+    log_ok "Detected MacPro7,1."
+  else
+    log_warn "MacPro7,1 requirement disabled. Detected product_name='$product'."
+  fi
+}
+gpu_bar0_allocated() {
+  local bdf="$1" expected="${2:-}" start end flags start_num end_num
+  [ -r "/sys/bus/pci/devices/$bdf/resource" ] || return 1
+  read -r start end flags < "/sys/bus/pci/devices/$bdf/resource" || return 1
+  [[ "$start" =~ ^0x[0-9A-Fa-f]+$ && "$end" =~ ^0x[0-9A-Fa-f]+$ ]] || return 1
+  start_num=$((16#${start#0x}))
+  end_num=$((16#${end#0x}))
+  (( start_num > 0 && end_num >= start_num )) || return 1
+  if [ -n "$expected" ]; then
+    (( end_num - start_num + 1 == expected )) || return 1
+  fi
+}
+
+gpu_bar2_allocated() {
+  local bdf="$1" start end flags start_num end_num
+  [ -r "/sys/bus/pci/devices/$bdf/resource" ] || return 1
+  read -r start end flags <<< "$(sed -n '3p' "/sys/bus/pci/devices/$bdf/resource")"
+  [[ "$start" =~ ^0x[0-9A-Fa-f]+$ && "$end" =~ ^0x[0-9A-Fa-f]+$ ]] || return 1
+  start_num=$((16#${start#0x}))
+  end_num=$((16#${end#0x}))
+  (( start_num > 0 && end_num >= start_num ))
+}
+
+guard_unassigned_gpu_bars() {
+  local dev bdf bad=0 target required_bar2 i
+  for dev in /sys/bus/pci/devices/*; do
+    [ -e "$dev" ] || continue
+    is_amd_display_gpu "$dev" || continue
+    bdf="$(basename "$dev")"
+    required_bar2=false
+    for target in "${TARGET_BDFS[@]}"; do
+      [ "$target" = "$bdf" ] && required_bar2=true
+    done
+    if ! gpu_bar0_allocated "$bdf" || { $required_bar2 && ! gpu_bar2_allocated "$bdf"; }; then
+      log_err "GPU $bdf has an unassigned required BAR: BLOCKING amdgpu binding."
+      printf 'none\n' > "$dev/driver_override" || return 1
+      bad=1
+    fi
+  done
+  [ "$bad" -eq 0 ]
+}
+
+ensure_amdgpu_loaded() {
+  # Only used before any direct setpci writes or after a VERIFIED PCI rescan.
+  if ! guard_unassigned_gpu_bars; then
+    log_err "Unassigned GPU BAR: refusing amdgpu module load."
+    return 1
+  fi
+  if ! lsmod | grep -q "^amdgpu "; then
+    log_info "Loading amdgpu with BAR0 bind guard..."
+    timeout 180 modprobe amdgpu
+  fi
+}
+print_discovery() {
+  echo >&2
+  log_info "Detected AMD display GPUs: ${#GPU_BDFS[@]}"
+  for bdf in "${GPU_BDFS[@]}"; do
+    echo " GPU: $bdf $(lspci -s "$bdf" 2>/dev/null || true)" >&2
+  done
+  echo >&2
+  log_info "Target GPUs with BAR0 ReBAR support: ${#TARGET_BDFS[@]}"
+  local i
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    echo " TARGET: $bdf cap=0x$(printf "%x" "${REBAR_CAP_OFFSETS[$i]}") ctrl=0x$(printf "%x" "${REBAR_CTRL_OFFSETS[$i]}") target_index=${TARGET_INDEXES[$i]} target_size=$(idx_to_human "${TARGET_INDEXES[$i]}")" >&2
+  done
+  echo >&2
+  log_info "Audio functions to unbind if bound: ${AUDIO_BDFS[*]:-none}"
+  log_info "Top bridge subtrees to remove/rescan: ${TOP_BRIDGES[*]:-none}"
+  log_info "Bridge chain diagnostics: ${BRIDGE_CHAIN_BDFS[*]:-none}"
+}
+phase1_diagnose() {
+  echo "============================================================" >&2
+  echo " Phase 1: Dynamic Discovery and Pre-Resize Diagnostics" >&2
+  echo "============================================================" >&2
+  if [ "$EUID" -ne 0 ]; then
+    log_err "This script must run as root."
+    exit 1
+  fi
+  verify_macpro
+  if grep -q "pci=realloc" /proc/cmdline; then
+    log_ok "Kernel booted with pci=realloc."
+  else
+    log_err "Kernel NOT booted with pci=realloc. Required for bridge window resizing."
+    exit 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    log_err "setpci not found. Install pciutils."
+    exit 1
+  fi
+  if lsmod | grep -q "^amdgpu "; then
+    log_warn "amdgpu already loaded. Will unbind target GPUs before resize."
+  else
+    log_ok "amdgpu not loaded. Clean single-init path."
+  fi
+  discover_targets
+  print_discovery
+  local selected_count="${#TARGET_BDFS[@]}"
+  if [ "$selected_count" -ne 2 ] && [ "$selected_count" -ne 4 ]; then
+    log_err "Found $selected_count eligible Duo GPUs (expected exactly 2 or 4); refusing PCI changes."
+    return 1
+  fi
+  if [ "$EXPECT_GPU_COUNT" -gt 0 ] && [ "$selected_count" -ne "$EXPECT_GPU_COUNT" ]; then
+    log_err "Expected $EXPECT_GPU_COUNT GPUs, found $selected_count; refusing PCI changes."
+    return 1
+  fi
+  local i bdf ctrl_off cur_idx resource0 bar_start bar_end bar_size
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    ctrl_off="${REBAR_CTRL_OFFSETS[$i]}"
+    echo >&2
+    log_info "GPU $bdf"
+    if [ -r "/sys/bus/pci/devices/$bdf/resource" ]; then
+      resource0="$(head -1 "/sys/bus/pci/devices/$bdf/resource")"
+      bar_start="$(echo "$resource0" | awk '{print $1}')"
+      bar_end="$(echo "$resource0" | awk '{print $2}')"
+      if [ "$bar_start" != "0x0000000000000000" ]; then
+        bar_size=$((16#${bar_end#0x} - 16#${bar_start#0x} + 1))
+        log_info "BAR0 current size: $(numfmt --to=iec-i --suffix=B "$bar_size" 2>/dev/null || echo "$bar_size bytes")"
+      fi
+    fi
+    cur_idx="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+    log_info "Current ReBAR index: $cur_idx ($(idx_to_human "$cur_idx"))"
+    log_info "Target ReBAR index: ${TARGET_INDEXES[$i]} ($(idx_to_human "${TARGET_INDEXES[$i]}"))"
+  done
+  echo >&2
+  log_info "Bridge prefetchable windows before resize:"
+  for bdf in "${BRIDGE_CHAIN_BDFS[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bdf" ]; then
+      pref="$(lspci -vvs "$bdf" 2>/dev/null | grep -i "Prefetchable memory behind" || true)"
+      [ -n "$pref" ] && echo " $bdf: $(echo "$pref" | sed 's/.*://' | xargs)" >&2
+    fi
+  done
+}
+phase2_resize() {
+  if lsmod | grep -q "^amdgpu "; then
+    log_err "amdgpu is already loaded; refusing a live PCI rescan. Reboot with the blacklist active."
+    return 1
+  fi
+  # Confirm that per-root-bus rescan nodes exist before modifying any BAR.
+  local root_bus bridge
+  for bridge in "${TOP_BRIDGES[@]}"; do
+    root_bus="${bridge%:*}"
+    if [ ! -w "/sys/devices/pci${root_bus}/pci_bus/${root_bus}/rescan" ]; then
+      log_err "Missing rescan node for PCI bus $root_bus. No BAR writes performed."
+      return 1
+    fi
+  done
+  echo >&2
+  echo "============================================================" >&2
+  echo " Phase 2: Direct setpci ReBAR + PCI Subtree Reset" >&2
+  echo "============================================================" >&2
+  local any_driver_bound=false bdf drv i before after ctrl_off target_idx bridge
+  for bdf in "${AUDIO_BDFS[@]}" "${TARGET_BDFS[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bdf/driver" ]; then
+      any_driver_bound=true
+      break
+    fi
+  done
+  if $any_driver_bound; then
+    log_info "Unbinding bound target GPU/audio drivers..."
+    for bdf in "${AUDIO_BDFS[@]}" "${TARGET_BDFS[@]}"; do
+      if [ -e "/sys/bus/pci/devices/$bdf/driver" ]; then
+        drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+        if echo "$bdf" > "/sys/bus/pci/drivers/$drv/unbind" 2>/dev/null; then
+          log_ok "Unbound $drv from $bdf"
+        else
+          log_err "Could not unbind $drv from $bdf; aborting before register writes."
+          return 1
+        fi
+      fi
+    done
+    sleep 2
+  else
+    log_ok "No target GPU/audio drivers to unbind."
+  fi
+  log_info "Writing ReBAR control registers..."
+  local rebar_ok=true
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    ctrl_off="${REBAR_CTRL_OFFSETS[$i]}"
+    target_idx="${TARGET_INDEXES[$i]}"
+    before="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+    log_info "$bdf before index $before ($(idx_to_human "$before"))"
+    if [ "$before" = "$target_idx" ]; then
+      log_ok "$bdf already at target index $target_idx"
+      continue
+    fi
+    if write_rebar_size_index_at_ctrl "$bdf" "$ctrl_off" "$target_idx"; then
+      after="$(read_rebar_size_index_at_ctrl "$bdf" "$ctrl_off")"
+      log_ok "$bdf written to index $after ($(idx_to_human "$after"))"
+    else
+      log_err "$bdf ReBAR write failed."
+      rebar_ok=false
+    fi
+  done
+  if ! $rebar_ok; then
+    log_err "At least one ReBAR write failed."
+    return 1
+  fi
+  log_info "Removing top-level PCI bridge subtrees..."
+  for bridge in "${TOP_BRIDGES[@]}"; do
+    if [ -e "/sys/bus/pci/devices/$bridge" ]; then
+      log_info "Removing $bridge"
+      echo 1 > "/sys/bus/pci/devices/$bridge/remove"
+      log_ok "Removed $bridge"
+    else
+      log_warn "$bridge not present."
+    fi
+  done
+  sleep 3
+  log_info "Rescanning only the affected root buses..."
+  local root_buses=() root_bus
+  for bridge in "${TOP_BRIDGES[@]}"; do
+    root_bus="${bridge%:*}"
+    uniq_add root_buses "$root_bus"
+  done
+  for root_bus in "${root_buses[@]}"; do
+    echo 1 > "/sys/devices/pci${root_bus}/pci_bus/${root_bus}/rescan"
+  done
+  sleep 5
+  # Never probe amdgpu after a rescan unless every target BAR0 was really
+  # allocated at its requested size; the ReBAR control index alone is unsafe.
+  local allocation_ok=true
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    if ! gpu_bar0_allocated "$bdf" "$(idx_to_bytes "${TARGET_INDEXES[$i]}")" || ! gpu_bar2_allocated "$bdf"; then
+      log_err "BAR0/BAR2 allocation check failed after rescan for $bdf."
+      allocation_ok=false
+    fi
+  done
+  guard_unassigned_gpu_bars || allocation_ok=false
+  if ! $allocation_ok; then
+    log_err "Unsafe PCI allocation: amdgpu will NOT be loaded. Reboot to recover."
+    return 1
+  fi
+  ensure_amdgpu_loaded
+  sleep 15
+  log_ok "amdgpu initialized after validated BAR0 assignments."
+}
+phase3_verify() {
+  echo >&2
+  echo "============================================================" >&2
+  echo " Phase 3: Verification After Rescan" >&2
+  echo "============================================================" >&2
+  box(){ t="$1";shift;w=0;for s;do ((${#s}>w))&&w=${#s};done;h="---- $t ";((${#h}>w+8))&&w=$((${#h}-8));b=$(printf "%$((w+8))s"|tr ' ' -);echo;printf "%s%.*s\n" "$h" $((${#b}-${#h})) "$b";printf "|%*s|\n" $((w+6)) "";for s;do printf "|   %-*s   |\n" "$w" "$s";done;printf "|%*s|\n%s\n\n" $((w+6)) "" "$b";}
+  mapfile -t BAR_LINES < <(
+ok(){ echo "[OK]   $*"; }
+bad(){ echo "[BAD]  $*"; }
+warn(){ echo "[WARN] $*"; }
+skip(){ echo "[SKIP] $*"; }
+info(){ echo "[INFO] $*"; }
+GPU_BDFS=("${TARGET_BDFS[@]}")
+BIND_BAD=0;BAD_BAR=0;GPU_N=0
+if [ "${#GPU_BDFS[@]}" -eq 0 ];then
+  echo "---- Final Diagnosis ----"
+  bad "Detected GPUs: 0"
+  skip "Wrong BAR0 GPUs: 0"
+  skip "Not bound to amdgpu: 0"
+  skip "BAR0 Check: SKIPPED"
+  skip "amdgpu Binding Check: SKIPPED"
+  bad "Result: No AMD display GPUs detected"
+  echo
+  echo "---- Comments ----"
+  warn "Check PCIe enumeration, power,"
+  warn "slot topology, and bridge state."
+else
+  for bdf in "${GPU_BDFS[@]}";do
+    echo "---- GPU $GPU_N: $bdf ----"
+    GPU_N=$((GPU_N+1))
+    pci="$(lspci -vv -s "$bdf" 2>/dev/null||true)"
+    bar0="$(printf "%s\n" "$pci"|grep -m1 "Region 0:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    bar2="$(printf "%s\n" "$pci"|grep -m1 "Region 2:"|sed -n 's/.*\[size=\([^]]*\)\].*/\1/p')"
+    [ -n "$bar0" ]||bar0="not-found"
+    [ -n "$bar2" ]||bar2="not-found"
+    if [ -L "/sys/bus/pci/devices/$bdf/driver" ];then
+      drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver")")"
+    else
+      drv="none"
+    fi
+    cap_off="$(find_rebar_cap_offset "$bdf" 2>/dev/null || true)"
+    if [ -n "$cap_off" ];then
+      idx="$(read_rebar_size_index_at_ctrl "$bdf" "$((cap_off+8))")"
+    else
+      idx="not-available"
+    fi
+    bar_ok=0
+    expected="${TARGET_INDEXES[$((GPU_N-1))]}"
+    if gpu_bar0_allocated "$bdf" "$(idx_to_bytes "$expected")"; then bar_ok=1; fi
+    [ "$bar_ok" = 1 ]&&ok "BAR0: $bar0"||bad "BAR0: $bar0 (expected $(idx_to_human "$expected"))"
+    [ "$bar2" != "not-found" ]&&ok "BAR2: $bar2"||warn "BAR2: $bar2"
+    [ "$drv" = "amdgpu" ]&&ok "Driver: $drv"||bad "Driver: $drv"
+    [ "$idx" = "$expected" ]&&ok "BAR0 Size Index: $idx"||bad "BAR0 Size Index: $idx (expected $expected)"
+    if [ "$bar_ok" = 1 ];then
+      ok "BAR0 / ReBAR status: OK"
+    else
+      BAD_BAR=$((BAD_BAR+1))
+      bad "BAR0 / ReBAR status: BAD"
+    fi
+    [ "$drv" = "amdgpu" ]||BIND_BAD=$((BIND_BAD+1))
+    echo
+  done
+  if [ "$BAD_BAR" -eq 0 ];then BAR_CHECK="OK";else BAR_CHECK="BAD";fi
+  if [ "$BIND_BAD" -eq 0 ];then BIND_CHECK="OK";else BIND_CHECK="BAD";fi
+  echo "---- Final Diagnosis ----"
+  ok "Detected GPUs: ${#GPU_BDFS[@]}"
+  if [ "$BAD_BAR" -eq 0 ];then
+    ok "Wrong BAR0 GPUs: $BAD_BAR"
+    ok "BAR0 Check: $BAR_CHECK"
+  else
+    bad "Wrong BAR0 GPUs: $BAD_BAR"
+    bad "BAR0 Check: $BAR_CHECK"
+  fi
+  if [ "$BIND_BAD" -eq 0 ];then
+    ok "Not bound to amdgpu: $BIND_BAD"
+    ok "amdgpu Binding Check: $BIND_CHECK"
+  else
+    bad "Not bound to amdgpu: $BIND_BAD"
+    bad "amdgpu Binding Check: $BIND_CHECK"
+  fi
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "Result: BAR0 / ReBAR OK, and GPUs Initialized Correctly"
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "Result: BAR0 / ReBAR Failed"
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    bad "Result: BAR0 / ReBAR OK, and amdgpu Binding Failed"
+  else
+    bad "Result: GPUs Failed to Initialize Correctly"
+  fi
+  echo
+  echo "---- Comments ----"
+  if [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "OK" ];then
+    ok "BAR0 / ReBAR OK."
+    ok "GPUs Initialized Correctly."
+  elif [ "$BAR_CHECK" = "BAD" ]&&[ "$BIND_CHECK" = "OK" ];then
+    bad "BAR0 / ReBAR Failed."
+    warn "Consider nbritton's method."
+  elif [ "$BAR_CHECK" = "OK" ]&&[ "$BIND_CHECK" = "BAD" ];then
+    ok "BAR0 / ReBAR OK."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  else
+    bad "GPUs Failed to Initialize Correctly."
+    warn "Consider patching the kernel for the"
+    warn "Infinity Fabric Link Bridge / Jumper and xGMI support."
+  fi
+fi
+)
+  box "GPU BAR0 / ReBAR Diagnosis" "${BAR_LINES[@]}"
+  # The summary above is human-readable. This strict check decides success.
+  local i bdf drv
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    gpu_bar0_allocated "$bdf" "$(idx_to_bytes "${TARGET_INDEXES[$i]}")" || return 1
+    gpu_bar2_allocated "$bdf" || return 1
+    drv="$(basename "$(readlink "/sys/bus/pci/devices/$bdf/driver" 2>/dev/null || echo none)")"
+    [ "$drv" = "amdgpu" ] || return 1
+  done
+}
+main() {
+  local mode="${1:---resize}"
+  echo "============================================================" >&2
+  echo " Dynamic nbritton-style AMD BAR resize" >&2
+  echo " Direct setpci ReBAR + PCI remove/rescan + modprobe amdgpu" >&2
+  echo "============================================================" >&2
+  if [ "$mode" = "--discover-only" ]; then
+    verify_macpro
+    discover_targets
+    print_discovery
+    exit 0
+  fi
+  if [ "$mode" != "--diagnose-only" ]; then
+    command -v flock >/dev/null 2>&1 || { log_err "flock is required."; exit 1; }
+    exec 9>/run/lock/apple-duo-rebar.lock
+    flock -n 9 || { log_err "Another resize operation is active; refusing to start."; exit 1; }
+  fi
+  if [ "$(uname -r)" != "$APPROVED_KERNEL" ] || \
+     [ "$(cat /proc/version_signature 2>/dev/null || uname -v)" != "$APPROVED_SIGNATURE" ]; then
+    log_err "Kernel build changed since approval; refusing PCI rescan."
+    if [ "$mode" = "--diagnose-only" ]; then exit 1; fi
+    log_warn "Skipping PCI resize; loading driver only for GPUs with an assigned BAR."
+    ensure_amdgpu_loaded
+    exit 0
+  fi
+  if ! grep -qw 'pci=realloc' /proc/cmdline && [ "$mode" != "--diagnose-only" ]; then
+    log_err "pci=realloc is absent from the boot command line."
+    log_warn "Skipping PCI resize. Using the existing allocated BARs instead."
+    ensure_amdgpu_loaded
+    exit 0
+  fi
+  phase1_diagnose
+  if [ "$mode" = "--diagnose-only" ]; then
+    log_info "Diagnostics complete."
+    exit 0
+  fi
+  # Do not destructively re-enumerate a Duo that already has full-size BARs.
+  local all_ready=true i bdf
+  for ((i=0; i<${#TARGET_BDFS[@]}; i++)); do
+    bdf="${TARGET_BDFS[$i]}"
+    if ! gpu_bar0_allocated "$bdf" "$(idx_to_bytes "${TARGET_INDEXES[$i]}")" || ! gpu_bar2_allocated "$bdf"; then
+      all_ready=false
+      break
+    fi
+  done
+  if $all_ready; then
+    log_ok "All selected Duo GPUs already have their target BAR allocations; skipping PCI rescan."
+    ensure_amdgpu_loaded
+    phase3_verify
+    exit 0
+  fi
+  if [ "$mode" != "--force" ]; then
+    read -rp "Proceed? (y/N): " confirm
+    if [ "${confirm,,}" != "y" ]; then
+      log_info "Aborted."
+      exit 0
+    fi
+  fi
+  if phase2_resize; then
+    phase3_verify
+  else
+    log_err "Resize failed. No unsafe amdgpu fallback after BAR writes."
+    log_err "Reboot to restore firmware's original PCI configuration."
+    exit 1
+  fi
+  echo "============================================================" >&2
+  echo " Done. Verify with: rocminfo" >&2
+  echo "============================================================" >&2
+}
+main "$@"
+SCRIPT_EOF
+sudo chmod 755 /usr/local/sbin/apple_duo_resize_bars.sh
+echo
+echo "Write systemd service:"
+sudo tee /etc/systemd/system/apple-duo-rebar.service >/dev/null <<'SERVICE_EOF'
+[Unit]
+Description=Dynamic nbritton-style AMD GPU BAR resize and amdgpu load
+DefaultDependencies=no
+Requires=local-fs.target sysinit.target systemd-udevd.service
+After=sysinit.target local-fs.target systemd-udevd.service systemd-modules-load.service
+Before=display-manager.service graphical.target multi-user.target
+Before=modprobe@amdgpu.service
+Wants=systemd-udevd.service
+FailureAction=none
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/apple-duo-rebar
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+ExecStart=/usr/local/sbin/apple_duo_resize_bars.sh --force
+RemainAfterExit=yes
+TimeoutStartSec=480
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_OVERRIDE CAP_SYS_MODULE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_SYS_MODULE
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/bus/pci /sys/devices
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=no
+ProtectKernelModules=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apple-duo-rebar
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+echo
+echo "Validate installed files:"
+sudo bash -n /usr/local/sbin/apple_duo_resize_bars.sh
+if [ "$INITRAMFS_BACKEND" = initramfs-tools ]; then
+  sudo sh -n /etc/initramfs-tools/hooks/apple-duo-amdgpu-blacklist
+else
+  sudo bash -n /etc/dracut.conf.d/95-apple-duo-amdgpu-rebar.conf
+fi
+sudo systemd-analyze verify /etc/systemd/system/apple-duo-rebar.service
+echo
+echo "Read-only GPU discovery (must find a complete one- or two-Duo layout):"
+DISCOVERY="$(sudo env \
+  MPX_REBAR_TARGET_REBAR_INDEX_MAX=15 \
+  MPX_REBAR_REQUIRE_MACPRO71=1 \
+  MPX_REBAR_ALLOW_THUNDERBOLT_GPUS=0 \
+  /usr/local/sbin/apple_duo_resize_bars.sh --discover-only 2>&1)" || {
+    printf '%s\n' "$DISCOVERY"
+    echo "ERROR: GPU discovery failed; do not reboot." >&2
+    exit 1
+  }
+printf '%s\n' "$DISCOVERY"
+DETECTED_TARGETS="$(printf '%s\n' "$DISCOVERY" | grep -c '^ TARGET:' || true)"
+if [ "$DETECTED_TARGETS" -ne 2 ] && [ "$DETECTED_TARGETS" -ne 4 ]; then
+  echo "ERROR: expected 2 or 4 Duo GPU targets; found $DETECTED_TARGETS." >&2
+  exit 1
+fi
+echo "IMPORTANT: Verify these are BOTH dies of each intended Apple Duo MPX module."
+
+echo "Install namespaced GRUB drop-in to add pci=realloc:"
+sudo install -d -m 755 /etc/default/grub.d
+sudo tee /etc/default/grub.d/95-apple-duo-rebar.cfg >/dev/null <<'GRUB_EOF'
+# Apple Duo MPX ReBAR: require kernel PCI resource reallocation.
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT} pci=realloc"
+GRUB_EOF
+echo
+echo "Rebuild initramfs for the running kernel and update GRUB:"
+if [ "$INITRAMFS_BACKEND" = dracut ]; then
+  sudo dracut --force "/boot/initrd.img-$KREL" "$KREL"
+else
+  sudo update-initramfs -u -k "$KREL"
+fi
+sudo update-grub
+echo
+echo "Verification:"
+KREL="$(uname -r)"
+INITRD="/boot/initrd.img-${KREL}"
+echo
+echo "--- GRUB drop-in ---"
+cat /etc/default/grub.d/95-apple-duo-rebar.cfg
+echo
+echo "--- generated grub.cfg current-kernel lines ---"
+GRUB_LINES="$(sudo grep "vmlinuz-${KREL}" /boot/grub/grub.cfg || true)"
+printf "%s\n" "$GRUB_LINES"
+echo
+echo "--- pci=realloc present in generated grub.cfg ---"
+if [[ "$GRUB_LINES" == *"pci=realloc"* ]]; then
+  echo "OK: pci=realloc present"
+else
+  echo "ERROR: pci=realloc missing"
+  false
+fi
+echo
+echo "--- blacklist present in initramfs ---"
+if [ "$INITRAMFS_BACKEND" = dracut ]; then
+  INITRD_LIST="$(sudo lsinitrd "$INITRD")"
+else
+  INITRD_LIST="$(sudo lsinitramfs "$INITRD")"
+fi
+if [[ "$INITRD_LIST" == *"etc/modprobe.d/99-apple-duo-rebar-blacklist.conf"* ]]; then
+  echo "OK: amdgpu blacklist present in initramfs ($INITRAMFS_BACKEND)"
+else
+  echo "ERROR: amdgpu blacklist missing from initramfs"
+  printf '%s\n' "$INITRD_LIST" | grep -Ei 'modprobe\.d|amdgpu|blacklist|apple-duo' || true
+  false
+fi
+echo
+echo "--- enable boot-time service (not started on this boot) ---"
+sudo systemctl daemon-reload
+sudo systemctl enable apple-duo-rebar.service
+systemctl is-enabled apple-duo-rebar.service
+echo
+echo "--- discovery was checked before GRUB or initramfs changes ---"
+echo
+echo "Installed successfully."
+echo "============================================================"
+echo "Review all diagnostics and ensure recovery is available."
+echo "After you are ready, reboot manually using a working recovery plan."
+echo "On next boot: sudo journalctl -u apple-duo-rebar.service -b --no-pager"
+echo "============================================================"
+APPLE_DUO_REBAR_INSTALL_V3
