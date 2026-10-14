@@ -1,0 +1,1735 @@
+#!/usr/bin/env bash
+# =============================================================================
+# MacPro2019LocalAI - Ubuntu 26.04 LTS kernel, IFLB, PCI-BAR, and PCIe P2P
+# =============================================================================
+# Maintainer/project credit: FaisalBiyari / MacPro2019LocalAI
+# Platform: Apple Mac Pro (2019), MacPro7,1, x86_64, Ubuntu 26.04 LTS
+# Baseline: newest OFFICIALLY RELEASED Ubuntu 26.04 GA generic kernel from APT
+#           (7.0.0-38.38 at the time this installer was drafted, 2026-10-12).
+#           Do NOT take kernels from resolute-proposed or a PPA.
+#
+# Combined from the original MacPro2019LocalAI Sienna Cichlid xGMI/IFLB
+# installer and the PCI-BAR / PCIe P2P repair installer. This is one file:
+# external downloads are only official Ubuntu packages/source and ten fixed
+# upstream Linux PCI commits, not unreviewed helper/installer scripts.
+#
+# Features:
+#   * Sienna Cichlid (Navi 21) xGMI / Infinity Fabric Linux Bridge (IFLB)
+#   * gfxhub_v2_1 framebuffer start/end initialization for hive mode
+#   * gfxhub_v2_1 XGMI physical-node discovery and function-table hook
+#   * Upstream PCI bridge-window/resource-allocation fixes (when absent)
+#   * LinuxAI child PCI window alignment: max(...) -> ALIGN(...)
+#   * Normal PCI SR-IOV on all GPU models; never creates VFs
+#   * DYNAMIC GPU-topology discovery and per-bridge ACS P2P selectors
+#   * Only GPU-exclusive PCIe subtrees selected, not unrelated devices
+#   * Unique Ubuntu ABI, intact working + official stock fallback, package holds
+#   * Apple T2 DKMS checks, safe GRUB update in /etc/default/grub ONLY
+#   * Single-run BUILD -> INSTALL -> ONE-TIME BOOT -> POST-BOOT VERIFICATION
+#   * After verified boot, automatic promotion to PERMANENT GRUB default
+#   * If verification fails, rescue kernel remains the permanent default
+#   * Original kernel command line restored on failed first boot
+#   * Compact terminal status and bounded non-recursive build logs
+#   * Rust 1.93.1 / LLVM 21.1.8 pinned in child Make PATH (v06)
+#
+# ONE-COPY-PASTE USE:
+#   bash MacPro2019LocalAI_Ubuntu_26.04_LTS_AllInOne_Kernel.txt
+#   The script asks ONCE for explicit ACS-risk + reboot consent on a terminal,
+#   then performs everything automatically. The same content may be pasted as
+#   a single block into an interactive Bash shell.
+#
+# OPTIONAL: --acs-report (read-only topology/ACS preview), --build-only,
+#           --no-reboot, --verify (read-only postboot checks), --help.
+# Defaults to full install + automatic reboot, then a systemd one-shot checks
+# the new kernel and promotes it to the permanent GRUB default only on PASS.
+# The system's current bootable kernel remains the GRUB default until then.
+#
+# WARNING: pci=disable_acs_redir weakens PCIe isolation/IOMMU grouping.
+# Exact PCI bus/device/function selectors are generated from the CURRENT
+# topology; changed bus numbering after reboot fails the verification gate.
+# Never use with untrusted SR-IOV guests, VFIO passthrough, or mixed
+# tenants on affected PCIe fabrics. An ACS override is NOT proof of P2P.
+# GPU and switch model IDs are NOT hardcoded. Standalone GPUs without
+# a shared GPU-only PCIe bridge will not receive an ACS override.
+# SECURITY: custom kernel packages are held; future Ubuntu kernel security
+# fixes will NOT update this custom ABI automatically. Rebuild and revalidate
+# against newer official Ubuntu source releases on an ongoing basis.
+#
+# NOT affiliated with or endorsed by Canonical, Apple, AMD, or the Linux Kernel.
+# Retain copyright/license notices from all Ubuntu and upstream sources.
+#
+# References:
+#   https://packages.ubuntu.com/resolute/linux-generic
+#   https://packages.ubuntu.com/resolute-updates/linux-generic
+#   https://github.com/torvalds/linux
+#   https://documentation.ubuntu.com/release-notes/26.04/
+#
+# v04 hotfix: numeric-only PCI GPU enumeration in both stages; eliminate
+# APT lookup pipelines prone to SIGPIPE/exit 141 with Bash pipefail.
+# VALIDATION STATUS: Original combined IFLB+PCI patches verified on the
+# MacPro2019LocalAI 7.0.0-3020 custom kernel: 10/10 GPUs initialized; 48/48
+# V620 directed static peer-read/write tests passed with TransferBench.
+# A NEW build from an updated Ubuntu security source (e.g. 7.0.0-38.38) must
+# be independently compiled, booted and validated before PUBLIC production
+# endorsement. Source-drift checks intentionally abort rather than guess.
+# =============================================================================
+
+bash -s -- "$@" <<'MACPRO2019LOCALAI_INSTALLER'
+set -Eeuo pipefail
+export LC_ALL=C
+export DEBIAN_FRONTEND=noninteractive
+
+PROJECT='MacPro2019LocalAI'
+MAINTAINER='FaisalBiyari'
+OS_RELEASE='26.04'
+CODENAME='resolute'
+EXPECTED_SERIES='7.0.0'
+FLAVOUR='generic'
+LOCAL_SUFFIX='macpro2019localai+iflbpcidyn07'
+ACS_RUNTIME=''
+ACS_GRUB=''
+ACS_TARGET_COUNT=0
+
+MODE='install'
+DO_REBOOT=1
+ACS_ACK=1
+for arg in "$@"; do
+    case "$arg" in
+        --build-only) MODE='build-only'; DO_REBOOT=0 ;;
+        --install) MODE='install' ;;
+        --verify) MODE='verify'; DO_REBOOT=0 ;;
+        --acs-report) MODE='acs-report'; DO_REBOOT=0 ;;
+        --accept-acs-risk) ACS_ACK=1 ;;
+        --no-reboot) DO_REBOOT=0 ;;
+        --reboot) DO_REBOOT=1 ;;
+        --help|-h)
+            printf '%s\n' \
+                'MacPro2019LocalAI / FaisalBiyari - single-run kernel installer' \
+                '  (no arguments)         full build/install/one-time reboot/autoverify' \
+                '                         prompts once for ACS security consent' \
+                '  --accept-acs-risk      explicitly consent; usable noninteractively' \
+                '  --no-reboot            complete install but defer one-time boot' \
+                '  --build-only           only build packages; no install or reboot' \
+                '  --verify               manual read-only verification' \
+                '  --acs-report           read-only GPU and ACS bridge discovery' \
+                '  --help                 show usage'
+            exit 0 ;;
+        *) printf 'ERROR: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+if (( DO_REBOOT )) && [[ "$MODE" != install ]]; then
+    echo 'ERROR: --reboot is only valid with --install' >&2
+    exit 2
+fi
+if [[ "$MODE" == install && "$ACS_ACK" -ne 1 ]]; then
+    if ! ( : < /dev/tty ) 2>/dev/null; then
+        echo 'STOP: no interactive terminal; rerun with --accept-acs-risk' >&2
+        exit 2
+    fi
+    printf '\n%s\n' \
+        'MacPro2019LocalAI will build/install a custom unsigned kernel,' \
+        'dynamically select GPU-only PCIe ACS bridges, and reboot once.' \
+        'ACS changes reduce isolation. Do not use with untrusted VFs/guests.' \
+        'On successful post-boot validation it becomes the PERMANENT kernel.' \
+        'On failure the current working kernel stays the GRUB default.' \
+        'Type I ACCEPT ACS RISK to continue: ' > /dev/tty
+    if ! IFS= read -r acknowledgement < /dev/tty 2>/dev/null; then
+        echo 'STOP: could not read terminal consent; use --accept-acs-risk' >&2
+        exit 2
+    fi
+    [[ "$acknowledgement" == 'I ACCEPT ACS RISK' ]] || {
+        echo 'STOP: ACS-risk consent was not given; no installation attempted.' >&2
+        exit 2
+    }
+    ACS_ACK=1
+fi
+
+banner() {
+    printf '\n================================================================\n'
+    printf ' %s\n' "$*"
+    printf '================================================================\n'
+}
+ok()   { printf '[OK]   %s\n' "$*"; }
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+# Retain failure context; never tee a growing build log back into itself.
+STEP='startup'
+KEEPALIVE_PID=''
+trap 'rc=$?; if [[ -n "$KEEPALIVE_PID" ]]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; fi; if (( rc != 0 )); then printf "[FAILED] step=%s exit=%s\n" "$STEP" "$rc" >&2; fi' EXIT
+
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing executable: $1"
+}
+
+# Discover actual PCIe GPU topology. Do not assume GPU IDs or PLX switch models.
+# Uses PCI sysfs topology and lspci ACS capabilities; never writes PCI config.
+# BDF selectors target exact bridge functions rather than unrelated same-ID bridges.
+write_acs_detector() {
+    cat > "$1" <<'ACS_DETECT_PY'
+#!/usr/bin/env python3
+"""MacPro2019LocalAI/FaisalBiyari: conservative GPU-only ACS discovery.
+
+Data only: emits a TSV of bridge BDF/vendor/device and a human-readable report.
+A matching PCI class 0x03 device is a GPU, regardless of GPU vendor or model.
+A bridge is eligible only in a subtree containing >=2 same-vendor GPUs,
+without unrelated endpoint functions, active VFs or VFIO ownership.
+Unrelated Thunderbolt, NIC and storage branches are deliberately excluded.
+
+ACS steering enables *possible* P2P; it does not prove peer accessibility,
+correct transfers, or cache coherency. PCI bus numbering may change on boot:
+post-boot verification must recheck every BDF and its vendor/device identity.
+"""
+from __future__ import annotations
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+BDF = re.compile(r'^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$')
+
+@dataclass(frozen=True)
+class Device:
+    bdf: str
+    path: Path
+    vendor: str
+    device: str
+    cls: int
+    driver: str
+    vfs: int
+
+    @property
+    def is_gpu(self):
+        return self.cls >> 16 == 0x03
+
+    @property
+    def is_bridge(self):
+        return self.cls >> 8 == 0x0604
+
+    @property
+    def audio(self):
+        return self.cls >> 8 == 0x0403
+
+
+def read_hex(path):
+    return int(path.read_text().strip(), 16)
+
+
+def inventory(sys_root):
+    items = []
+    for entry in sorted(sys_root.iterdir()):
+        if not BDF.fullmatch(entry.name):
+            continue
+        real = entry.resolve(strict=True)
+        driver_link = entry / 'driver'
+        driver = driver_link.resolve().name if driver_link.is_symlink() else 'none'
+        vf_path = entry / 'sriov_numvfs'
+        vfs = int(vf_path.read_text().strip()) if vf_path.exists() else 0
+        items.append(Device(entry.name.lower(), real,
+                            f'{read_hex(entry / "vendor"):04x}',
+                            f'{read_hex(entry / "device"):04x}',
+                            read_hex(entry / 'class'), driver, vfs))
+    if not items:
+        raise ValueError('No readable PCI sysfs devices')
+    return items
+
+
+def under(dev, bridge):
+    return bridge.path == dev.path or bridge.path in dev.path.parents
+
+
+def clean_gpu_subtree(bridge, devices, gpus):
+    children = [d for d in devices if under(d, bridge)]
+    group = [g for g in gpus if under(g, bridge)]
+    if len(group) < 2:
+        return False, group, 'less than two GPUs'
+    vendors = {g.vendor for g in group}
+    if len(vendors) != 1:
+        return False, group, 'mixed GPU vendors'
+    for d in children:
+        if d.vfs > 0 or d.driver == 'vfio-pci':
+            return False, group, 'active SR-IOV/VFIO device'
+        if d.is_bridge or d.is_gpu:
+            continue
+        # Ordinary HDMI/DP audio function belonging to the same GPU slot.
+        same_slot = any(g.bdf.rsplit('.', 1)[0] == d.bdf.rsplit('.', 1)[0]
+                        and g.vendor == d.vendor for g in group)
+        if d.audio and same_slot:
+            continue
+        return False, group, 'unrelated endpoint ' + d.bdf
+    return True, group, ''
+
+
+def acs_capability(bdf, lspci):
+    p = subprocess.run([lspci, '-vv', '-s', bdf], capture_output=True,
+                       text=True, timeout=15)
+    if p.returncode:
+        raise RuntimeError(f'lspci failed for {bdf}: {p.stderr.strip()}')
+    cap = bool(re.search(r'^\s*ACSCap:', p.stdout, re.M))
+    ctl = re.search(r'^\s*ACSCtl:\s*(.+)$', p.stdout, re.M)
+    if cap and not ctl:
+        raise RuntimeError(f'ACS capability/control inconsistent at {bdf}')
+    return cap, (ctl.group(1) if ctl else '')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('sys_root', type=Path)
+    ap.add_argument('targets', type=Path)
+    ap.add_argument('report', type=Path)
+    ap.add_argument('--lspci', default='/usr/bin/lspci')
+    args = ap.parse_args()
+    devices = inventory(args.sys_root)
+    gpus = [d for d in devices if d.is_gpu]
+    bridges = [d for d in devices if d.is_bridge]
+    if not gpus:
+        raise ValueError('No PCI display/3D GPUs detected')
+    lines = ['MacPro2019LocalAI / FaisalBiyari - dynamic ACS topology',
+             'GPU inventory (vendor IDs, no model assumptions):']
+    for gpu in gpus:
+        lines.append(f'  GPU {gpu.bdf} {gpu.vendor}:{gpu.device} driver={gpu.driver}')
+    candidates = {}
+    rejected = []
+    for bridge in bridges:
+        suitable, group, reason = clean_gpu_subtree(bridge, devices, gpus)
+        if suitable:
+            candidates[bridge.bdf] = (bridge, group)
+        elif len(group) >= 2:
+            rejected.append(f'{bridge.bdf} ({len(group)} GPUs): {reason}')
+    # Keep maximal *GPU-only* subtrees. Ancestors containing Thunderbolt, NIC,
+    # unrelated functions, or a different GPU vendor are never eligible.
+    maximal = []
+    for bridge, group in candidates.values():
+        if not any(other.path in bridge.path.parents
+                   for other, _ in candidates.values()):
+            maximal.append((bridge, group))
+    targets = {}
+    for root, group in sorted(maximal, key=lambda x: x[0].bdf):
+        group_names = ','.join(sorted(g.bdf for g in group))
+        lines.append(f'GPU-ONLY-GROUP {root.bdf}: {len(group)} GPUs [{group_names}]')
+        for child in bridges:
+            if not under(child, root):
+                continue
+            if not any(under(g, child) for g in group):
+                continue
+            cap, ctl = acs_capability(child.bdf, args.lspci)
+            if not cap:
+                continue
+            if child.bdf in targets and targets[child.bdf] != child:
+                raise RuntimeError('Conflicting bridge identity ' + child.bdf)
+            targets[child.bdf] = child
+            lines.append(f'  ACS-BRIDGE {child.bdf} {child.vendor}:{child.device} {ctl}')
+    for item in sorted(set(rejected)):
+        lines.append('EXCLUDED-SHARED-BRANCH ' + item)
+    with args.targets.open('w') as out:
+        for child in sorted(targets.values(), key=lambda d: d.bdf):
+            out.write(f'{child.bdf}\t{child.vendor}\t{child.device}\n')
+    lines.append('ACS_MODE=' + ('SELECTED' if targets else 'NONE'))
+    lines.append(f'ACS_TARGET_COUNT={len(targets)}')
+    lines.append('P2P_CORRECTNESS=NOT_TESTED')
+    lines.append('SECURITY=ACS REDIRECTION LOWERS PCIe ISOLATION ON SELECTED BRIDGES')
+    args.report.write_text('\n'.join(lines) + '\n')
+    print(f'GPU_COUNT={len(gpus)}')
+    print(f'GPU_ONLY_GROUPS={len(maximal)}')
+    print(f'ACS_TARGET_COUNT={len(targets)}')
+    print('ACS_MODE=' + ('SELECTED' if targets else 'NONE'))
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print('ACS_DISCOVERY=FAIL: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+ACS_DETECT_PY
+}
+
+check_platform() {
+    STEP='platform preflight'
+    [[ -r /etc/os-release ]] || die 'Missing /etc/os-release'
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == "$OS_RELEASE" &&
+       "${VERSION_CODENAME:-}" == "$CODENAME" ]] ||
+        die "Expected Ubuntu 26.04 LTS ($CODENAME); detected ${PRETTY_NAME:-unknown}"
+    [[ "$(dpkg --print-architecture)" == amd64 ]] || die 'Only amd64 is supported'
+    [[ "$(uname -m)" == x86_64 ]] || die 'Only x86_64 is supported'
+    local product vendor
+    product="$(tr -d '\000' </sys/class/dmi/id/product_name 2>/dev/null || true)"
+    vendor="$(tr -d '\000' </sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+    [[ "$product" == 'MacPro7,1' ]] || die "Unsupported DMI product: ${product:-unknown}; requires MacPro7,1"
+    [[ "$vendor" == Apple* ]] || warn "Unexpected system vendor: $vendor"
+    [[ "$(id -u)" -ne 0 ]] || die 'Run as a normal sudo-enabled user, not as root'
+    [[ -d /boot/grub ]] || die 'GRUB directory /boot/grub is missing'
+    if command -v mokutil >/dev/null 2>&1 &&
+       mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
+        die 'Secure Boot is enabled; this installer builds an unsigned kernel'
+    fi
+    info "Platform: $PROJECT | $product | Ubuntu $OS_RELEASE"
+}
+
+# Uses read-only standard utilities; does not require ROCm to be installed.
+verify_current() {
+    banner "${PROJECT} / ${MAINTAINER} - POST-BOOT VERIFICATION"
+    check_platform
+    STEP='runtime verification'
+    local running gpu_count=0 bound_count=0 bar_count=0 vf_enabled=0
+    local all_gpu_count=0 bdf driver start end flags vf_count issues=0 gpu_rocm
+    local acs_count=0 acs_off=0 acs_ctl
+    running="$(uname -r)"
+    info "Running kernel: $running"
+    grep -E '^GRUB_(DEFAULT|CMDLINE_LINUX_DEFAULT)=' /etc/default/grub || true
+    if grep -Fq "Ubuntu, with Linux $running" /etc/default/grub; then
+        ok 'Running kernel matches permanent GRUB default'
+    else
+        warn 'GRUB default differs from the running kernel'
+        ((issues+=1))
+    fi
+    local manifest_acs='/var/lib/macpro2019localai/acs-targets.tsv'
+    local bdf_id vendor_id device_id sys_id acs_expected
+    if [[ -r "$manifest_acs" ]]; then
+        acs_expected="$(wc -l < "$manifest_acs")"
+        echo "ACS_EXPECTED_BRIDGES=$acs_expected"
+        if (( acs_expected > 0 )) && ! grep -Fq 'pci=disable_acs_redir=' /proc/cmdline; then
+            warn 'Dynamic ACS policy missing from running kernel'
+            ((issues+=1))
+        fi
+        while IFS=$'\t' read -r bdf_id vendor_id device_id; do
+            [[ -n "$bdf_id" ]] || continue
+            sys_id="/sys/bus/pci/devices/$bdf_id"
+            if [[ ! -r "$sys_id/vendor" || ! -r "$sys_id/device" ]] ||
+               [[ "$(cat "$sys_id/vendor")" != "0x$vendor_id" ]] ||
+               [[ "$(cat "$sys_id/device")" != "0x$device_id" ]]; then
+                warn "ACS bridge missing or renumbered: $bdf_id $vendor_id:$device_id"
+                ((issues+=1))
+                continue
+            fi
+            acs_ctl="$(lspci -vv -s "$bdf_id" | grep 'ACSCtl:' || true)"
+            if [[ "$acs_ctl" != *'ReqRedir-'* || "$acs_ctl" != *'CmpltRedir-'* ]]; then
+                warn "ACS redirects still enabled at $bdf_id"
+                ((issues+=1))
+            fi
+        done < "$manifest_acs"
+    else
+        info 'No installed dynamic ACS target manifest; ACS audit unavailable'
+    fi
+    if grep -Eq '(^| )iommu=pt( |$)' /proc/cmdline; then
+        ok 'IOMMU passthrough mode active'
+    else
+        warn 'iommu=pt not active'
+        ((issues+=1))
+    fi
+
+    while read -r bdf; do
+        [[ -n "$bdf" ]] || continue
+        ((gpu_count+=1))
+        driver='none'
+        if [[ -L "/sys/bus/pci/devices/$bdf/driver" ]]; then
+            driver="$(basename "$(readlink -f "/sys/bus/pci/devices/$bdf/driver")")"
+        fi
+        [[ "$driver" == amdgpu ]] && ((bound_count+=1))
+        read -r start end flags < "/sys/bus/pci/devices/$bdf/resource"
+        if (( start != 0 && end >= start )); then ((bar_count+=1)); fi
+    done < <(lspci -Dn -d 1002: | awk '$2 ~ /^03/ {print $1}')
+    while read -r bdf; do
+        [[ -n "$bdf" ]] || continue
+        if [[ -r "/sys/bus/pci/devices/$bdf/sriov_numvfs" ]]; then
+            vf_count="$(cat "/sys/bus/pci/devices/$bdf/sriov_numvfs")"
+            [[ "$vf_count" =~ ^[0-9]+$ ]] || die "Invalid SR-IOV VF count on $bdf"
+            vf_enabled=$((vf_enabled + vf_count))
+        fi
+    done < <(lspci -Dn | awk '$2 ~ /^03/ {print $1}')
+    all_gpu_count="$(lspci -Dn | awk '$2 ~ /^03/ {n++} END{print n+0}')"
+    echo "ALL_PCI_DISPLAY_GPUS=$all_gpu_count"
+    echo "AMD_DISPLAY_GPUS=$gpu_count"
+    echo "AMDGPU_BOUND=$bound_count"
+    echo "BAR0_ASSIGNED=$bar_count"
+    echo "ACTIVE_SRIOV_VFS=$vf_enabled"
+    if (( all_gpu_count > 0 && gpu_count == bound_count && gpu_count == bar_count )); then
+        ok 'All detected AMD GPUs are bound and BAR0-assigned'
+        (( gpu_count > 0 )) || info 'No AMD GPU installed; non-AMD driver validation is external'
+    else
+        warn 'GPU/BAR initialization incomplete; examine dmesg and lspci'
+        ((issues+=1))
+    fi
+    if (( vf_enabled > 0 )); then
+        warn 'SR-IOV VFs are active; the validated bare-metal P2P setup used zero VFs'
+    fi
+
+    # ACS bridge checks above use the auto-discovered per-BDF manifest only.
+    # Unrelated PCIe bridges (Thunderbolt, NIC, NVMe) are never assumed targets.
+    echo 'P2P_CORRECTNESS=NOT_TESTED (run an independent transfer validator)'
+
+    if command -v rocm-smi >/dev/null 2>&1; then
+        gpu_rocm="$(rocm-smi -i 2>/dev/null | grep -c 'Device Name:' || true)"
+        echo "ROCM_GPUS=$gpu_rocm"
+        if [[ "$gpu_rocm" =~ ^[0-9]+$ ]] && (( gpu_rocm <= gpu_count )); then
+            ok 'ROCm GPU count recorded (not all AMD GPU models are supported)'
+        else
+            warn 'ROCm reported an inconsistent GPU count'
+            ((issues+=1))
+        fi
+    else
+        info 'ROCm not installed; ROCm P2P validation deferred'
+    fi
+    if command -v dkms >/dev/null 2>&1; then
+        dkms status -k "$running" 2>/dev/null | grep -E '^apple-bce/|^applesmc-t2/' || true
+        local mod
+        for mod in apple-bce applesmc-t2; do
+            if dkms status 2>/dev/null | grep -q "^$mod/"; then
+                if ! dkms status -k "$running" 2>/dev/null | grep -Eq "^$mod/.*installed"; then
+                    warn "$mod is not built for the running kernel"
+                    ((issues+=1))
+                fi
+            fi
+        done
+    fi
+    if (( issues == 0 )); then
+        echo 'VERIFICATION=PASS'
+    else
+        echo "VERIFICATION=FAIL issues=$issues"
+        return 1
+    fi
+    info 'Peer-access reporting does not prove dynamic changing-data coherence.'
+}
+
+if [[ "$MODE" == acs-report ]]; then
+    check_platform
+    require_tool python3
+    require_tool lspci
+    sudo -v || die 'sudo authentication failed'
+    ACS_PREVIEW_DIR="$(mktemp -d)"
+    trap 'rm -rf -- "$ACS_PREVIEW_DIR"' EXIT
+    write_acs_detector "$ACS_PREVIEW_DIR/detect.py"
+    sudo python3 "$ACS_PREVIEW_DIR/detect.py" \
+        /sys/bus/pci/devices "$ACS_PREVIEW_DIR/acs-targets.tsv" \
+        "$ACS_PREVIEW_DIR/report.txt" || die 'ACS topology discovery failed'
+    sudo cat "$ACS_PREVIEW_DIR/report.txt"
+    echo 'RESULT=READ_ONLY_NO_PCI_CHANGES'
+    exit 0
+fi
+if [[ "$MODE" == verify ]]; then
+    verify_current
+    exit 0
+fi
+
+banner "${PROJECT} / ${MAINTAINER} - UBUNTU 26.04 KERNEL BUILD"
+check_platform
+for tool in sudo apt-get apt-cache dpkg-query dpkg-deb python3 git curl find awk grep sed; do
+    require_tool "$tool"
+done
+if [[ "$MODE" == install ]]; then
+    for tool in grub-reboot grub-editenv update-grub grub-script-check systemctl; do
+        require_tool "$tool"
+    done
+fi
+sudo -v || die 'sudo authentication failed'
+if [[ "$MODE" == install ]]; then
+    STEP='working kernel fallback and GPU inventory'
+    RESCUE_KREL="$(uname -r)"
+    [[ "$RESCUE_KREL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]] ||
+        die "Current running kernel is not a supported generic rescue kernel: $RESCUE_KREL"
+    [[ -s "/boot/vmlinuz-$RESCUE_KREL" && -s "/boot/initrd.img-$RESCUE_KREL" ]] ||
+        die "Current running kernel lacks GRUB rescue boot files: $RESCUE_KREL"
+    if sudo test -e /var/lib/macpro2019localai/pending.conf; then
+        die 'Another installation is awaiting its first boot; inspect /var/lib/macpro2019localai'
+    fi
+    if sudo grub-editenv /boot/grub/grubenv list | grep -Eq '^next_entry=.'; then
+        die 'A one-time GRUB boot is already scheduled; do not override it'
+    fi
+    require_tool lspci
+    AMD_GPUS_BEFORE="$(lspci -Dn -d 1002: | awk '$2 ~ /^03/ {n++} END{print n+0}')"
+    ALL_GPUS_BEFORE="$(lspci -Dn | awk '$2 ~ /^03/ {n++} END{print n+0}')"
+    (( ALL_GPUS_BEFORE > 0 )) || die 'No PCIe display/3D GPU found; stop before altering kernel'
+    # A Radeon can be correctly initialized by amdgpu yet unsupported by ROCm.
+    # Postboot only requires preserving the ROCm GPU count that worked before.
+    ROCM_BEFORE=0
+    if command -v rocm-smi >/dev/null 2>&1; then
+        ROCM_BEFORE="$(timeout 20s rocm-smi -i 2>/dev/null | grep -c 'Device Name:' || true)"
+        [[ "$ROCM_BEFORE" =~ ^[0-9]+$ ]] || ROCM_BEFORE=0
+    fi
+    ACTIVE_VFS=0
+    while read -r bdf; do
+        [[ -n "$bdf" ]] || continue
+        sf="/sys/bus/pci/devices/$bdf/sriov_numvfs"
+        if [[ -r "$sf" ]]; then
+            n="$(cat "$sf")"
+            [[ "$n" =~ ^[0-9]+$ ]] || die "Invalid VF count for $bdf"
+            ACTIVE_VFS=$((ACTIVE_VFS+n))
+        fi
+    done < <(lspci -Dn | awk '$2 ~ /^03/ {print $1}')
+    (( ACTIVE_VFS == 0 )) || die 'Active GPU SR-IOV VFs detected; ACS weakening is unsafe here'
+    info "Working rescue kernel: $RESCUE_KREL"
+    info "PCI display GPUs: $ALL_GPUS_BEFORE; AMD: $AMD_GPUS_BEFORE"
+    (( AMD_GPUS_BEFORE > 0 )) || warn 'No AMD GPU: IFLB modifications will remain dormant; non-AMD driver must be validated after boot'
+fi
+# Keep the user's sudo credential refreshed during a potentially long kernel build.
+( while sleep 55; do sudo -n true >/dev/null 2>&1 || exit 0; done ) &
+KEEPALIVE_PID=$!
+
+if findmnt -rn -t zfs 2>/dev/null | grep -q . || lsmod | grep -q '^zfs '; then
+    die 'Active ZFS detected. Custom-ABI ZFS module dependency cannot safely be removed.'
+fi
+
+# No changes to persistent GRUB parameters outside /etc/default/grub.
+# Refuse unknown drop-ins overriding our key settings; do not delete them.
+if [[ "$MODE" == install && -d /etc/default/grub.d ]]; then
+    if grep -EH '^[[:space:]]*GRUB_(DEFAULT|CMDLINE_LINUX_DEFAULT|CMDLINE_LINUX)=' \
+       /etc/default/grub.d/*.cfg 2>/dev/null; then
+        die 'GRUB drop-in overrides found; consolidate them manually in /etc/default/grub first.'
+    fi
+fi
+
+# Reject proposed repositories rather than choosing a later, untested RC.
+STEP='APT repository preflight'
+if apt-cache policy | grep -F "$CODENAME-proposed" >/dev/null; then
+    die "Detected active $CODENAME-proposed APT repository; disable it before building a stable LTS kernel"
+fi
+
+# Standard Ubuntu source repositories (not a third-party PPA).
+if ! (set +o pipefail; apt-cache showsrc linux 2>/dev/null | grep -q '^Package: linux$'); then
+    SRC_LIST='/etc/apt/sources.list.d/macpro2019localai-deb-src.sources'
+    [[ ! -e "$SRC_LIST" ]] || die "Existing source-list file needs inspection: $SRC_LIST"
+    sudo tee "$SRC_LIST" >/dev/null <<'APT_SOURCES'
+Types: deb-src
+URIs: https://archive.ubuntu.com/ubuntu/
+Suites: resolute resolute-updates
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb-src
+URIs: https://security.ubuntu.com/ubuntu/
+Suites: resolute-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+APT_SOURCES
+    info "Enabled official Ubuntu source repositories: $SRC_LIST"
+fi
+
+STEP='APT index refresh'
+sudo apt-get update -qq || die 'apt-get update failed'
+
+# Derive the CURRENT candidate from linux-image-generic, never from the
+# newest name found in /boot (which could be a different ABI/custom kernel).
+META_VERSION="$(apt-cache policy linux-image-generic | awk '/Candidate:/ && !found++ {print $2}')"
+[[ -n "$META_VERSION" && "$META_VERSION" != '(none)' ]] || die 'No linux-image-generic candidate available'
+STOCK_KREL="$({ apt-cache show "linux-image-generic=$META_VERSION" 2>/dev/null || true; } | \
+    python3 -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"\blinux-image-(\d+\.\d+\.\d+-\d+-generic)\b",s); print(m.group(1) if m else "")')"
+[[ "$STOCK_KREL" =~ ^7\.0\.0-[0-9]+-generic$ ]] ||
+    die "Unexpected GA generic kernel candidate: ${STOCK_KREL:-missing}. This release supports 7.0.0 only."
+SOURCE_VER="$(apt-cache show "linux-modules-$STOCK_KREL" 2>/dev/null | awk '/^Version: / && !found++ {print $2}')"
+[[ "$SOURCE_VER" =~ ^7\.0\.0-[0-9]+\.[0-9]+$ ]] ||
+    die "Unable to establish official Ubuntu linux source version for $STOCK_KREL"
+[[ "$SOURCE_VER" == "$META_VERSION" ]] ||
+    die "Kernel source/package version mismatch: $SOURCE_VER versus meta $META_VERSION"
+info "Official Ubuntu candidate: $STOCK_KREL ($SOURCE_VER)"
+info 'Only published updates/security pockets are accepted; -proposed excluded.'
+
+STEP='install build dependencies'
+# Ubuntu kernel build-deps supply e.g. clang-21, bindgen and Rust support.
+sudo apt-get install -y -qq \
+    build-essential fakeroot dpkg-dev devscripts debhelper bc bison flex \
+    libssl-dev libelf-dev libncurses-dev dwarves pahole rsync git curl \
+    ca-certificates patch zstd lz4 cpio kmod pciutils python3 \
+    mokutil dkms wireless-regdb linux-base >/dev/null ||
+    die 'Failed to install core build prerequisites'
+sudo apt-get build-dep -y linux >/dev/null || die 'Ubuntu linux build dependencies failed'
+# Pin the known-working Rust/LLVM toolchain for the 7.0 MacPro2019LocalAI
+# kernel build; these are official Ubuntu archive packages, not PPAs.
+sudo apt-get install -y -qq clang-21 llvm-21-dev rustc-1.93 >/dev/null ||
+    die 'Required clang-21 / LLVM-21 / rustc-1.93 are unavailable from APT'
+if mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
+    die 'Secure Boot is enabled; cannot safely install this unsigned kernel'
+fi
+[[ -x /usr/bin/rustc-1.93 ]] || die 'rustc-1.93 executable missing'
+[[ -x /usr/bin/clang-21 ]] || die 'clang-21 executable missing'
+
+# Unique workspace per invocation. No inherited home/sync recursive logging.
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+if mountpoint -q /sync && { [[ -w /sync/src ]] || [[ -w /sync ]]; }; then
+    WORK_ROOT='/sync/src'
+else
+    WORK_ROOT="$HOME/macpro2019localai-builds"
+fi
+[[ -n "${MACPRO_WORK_ROOT:-}" ]] && WORK_ROOT="$MACPRO_WORK_ROOT"
+mkdir -p "$WORK_ROOT" || die "Cannot create build root: $WORK_ROOT"
+[[ -w "$WORK_ROOT" ]] || die "Build root not writable: $WORK_ROOT"
+FREE_KIB="$(df -Pk "$WORK_ROOT" | awk 'NR==2 {print $4}')"
+(( FREE_KIB >= 45 * 1024 * 1024 )) ||
+    die 'At least 45 GiB of free build-space is required before downloading source'
+BASE="$(mktemp -d "$WORK_ROOT/macpro2019localai-${STAMP}-XXXXXXXX")"
+PATCH_DIR="$BASE/upstream-pci-patches"
+mkdir -p "$PATCH_DIR"
+printf '%s\n' "PROJECT=$PROJECT" "MAINTAINER=$MAINTAINER" \
+    "STOCK_KERNEL=$STOCK_KREL" "STOCK_SOURCE=$SOURCE_VER" \
+    "WORKSPACE=$BASE" > "$BASE/manifest.txt"
+info "Build workspace: $BASE"
+
+# Discover P2P-relevant GPU-exclusive PCIe branches on THIS Mac Pro. This is
+# read-only. No fixed GPU vendor/device or PLX/AMD bridge IDs are used.
+STEP='dynamic GPU/PCIe ACS topology discovery'
+write_acs_detector "$BASE/acs-discovery.py"
+if ! sudo python3 "$BASE/acs-discovery.py" /sys/bus/pci/devices \
+     "$BASE/acs-targets.tsv" "$BASE/acs-topology-report.txt" \
+     > "$BASE/acs-discovery.log" 2>&1; then
+    tail -n 24 "$BASE/acs-discovery.log" >&2
+    die 'ACS topology discovery failed; refusing automatic PCI ACS changes'
+fi
+ACS_TARGET_COUNT="$(wc -l < "$BASE/acs-targets.tsv")"
+[[ "$ACS_TARGET_COUNT" =~ ^[0-9]+$ ]] || die 'Invalid ACS target count'
+(( ACS_TARGET_COUNT <= 64 )) || die 'Too many ACS bridge targets; manual PCI topology review needed'
+if (( ACS_TARGET_COUNT > 0 )); then
+    mapfile -t ACS_SELECTORS < <(cut -f1 "$BASE/acs-targets.tsv")
+    # pci_dev_str_match() accepts explicit [domain:]bus:device.function BDFs.
+    # Using per-device BDFs avoids silently weakening unrelated same-ID bridges.
+    ACS_JOINED="$(IFS=';'; echo "${ACS_SELECTORS[*]}")"
+    ACS_RUNTIME="pci=disable_acs_redir=$ACS_JOINED"
+    ACS_GRUB="${ACS_RUNTIME//;/\\;}"  # escape semicolons for GRUB shell parsing
+    (( ${#ACS_RUNTIME} < 1600 )) || die 'ACS command-line parameter too long'
+else
+    ACS_RUNTIME=''
+    ACS_GRUB=''
+fi
+# Baseline identity/driver snapshot for ALL PCI display devices. For non-AMD
+# cards, preserve a currently working driver (e.g., NVIDIA or Intel), rather
+# than claiming that amdgpu-specific checks validate that card.
+GPU_INVENTORY="$BASE/gpu-inventory.tsv"
+: > "$GPU_INVENTORY"
+while read -r gpu_bdf; do
+    [[ -n "$gpu_bdf" ]] || continue
+    gpu_sys="/sys/bus/pci/devices/$gpu_bdf"
+    [[ -r "$gpu_sys/vendor" && -r "$gpu_sys/device" ]] ||
+        die "GPU sysfs metadata missing: $gpu_bdf"
+    gpu_drv='none'
+    [[ -L "$gpu_sys/driver" ]] &&
+        gpu_drv="$(basename "$(readlink -f "$gpu_sys/driver")")"
+    printf '%s\t%s\t%s\t%s\n' "$gpu_bdf" \
+        "$(cat "$gpu_sys/vendor")" "$(cat "$gpu_sys/device")" \
+        "$gpu_drv" >> "$GPU_INVENTORY"
+done < <(lspci -Dn | awk '$2 ~ /^03/ {print $1}')
+[[ "$(wc -l < "$GPU_INVENTORY")" -eq "$ALL_GPUS_BEFORE" ]] ||
+    die 'PCIe GPU inventory was inconsistent during discovery'
+info "Auto-discovered ACS targets: $ACS_TARGET_COUNT"
+info "ACS policy: ${ACS_RUNTIME:-NO_OVERRIDE (no eligible GPU-only bridge group)}"
+grep -E '^GPU-ONLY-GROUP|^EXCLUDED-SHARED-BRANCH' \
+    "$BASE/acs-topology-report.txt" | head -n 14 || true
+printf 'ACS_TARGET_COUNT=%s\nACS_RUNTIME=%s\n' \
+    "$ACS_TARGET_COUNT" "$ACS_RUNTIME" >> "$BASE/manifest.txt"
+
+STEP='download canonical source'
+(
+    cd "$BASE"
+    apt-get source -qq "linux=$SOURCE_VER" > "$BASE/source-download.log" 2>&1
+) || { tail -n 18 "$BASE/source-download.log" >&2; die 'Pinned Canonical linux source download failed'; }
+SRC="$(find "$BASE" -mindepth 1 -maxdepth 1 -type d -name 'linux-*' -print -quit)"
+[[ -n "$SRC" && -f "$SRC/debian.master/changelog" &&
+   -f "$SRC/drivers/pci/setup-bus.c" &&
+   -f "$SRC/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c" ]] ||
+    die 'Ubuntu kernel source structure differs from the validated layout'
+cd "$SRC"
+ACTUAL_VERSION="$(dpkg-parsechangelog -l debian.master/changelog -S Version)"
+[[ "$ACTUAL_VERSION" == "$SOURCE_VER" ]] ||
+    die "Downloaded source version differs: $ACTUAL_VERSION versus $SOURCE_VER"
+[[ -x debian/rules ]] || die 'Ubuntu debian/rules missing'
+
+STEP='prepare clean Ubuntu source'
+if ! fakeroot debian/rules clean > "$BASE/clean.log" 2>&1; then
+    tail -n 18 "$BASE/clean.log" >&2
+    die 'Ubuntu source clean failed'
+fi
+
+# ----------------------------------------------------------------------------
+# STEP 2: Sienna Cichlid xGMI / IFLB patch. Retain contemporary kernel code
+# wherever possible. No wholesale function replacement of upstream FB logic.
+# ----------------------------------------------------------------------------
+banner 'STEP 2: Apply and verify Sienna Cichlid IFLB changes'
+STEP='IFLB source patch'
+python3 - <<'IFLB_PY'
+from pathlib import Path
+import re
+
+gmc = Path('drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c')
+gfx = Path('drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c')
+a = gmc.read_text()
+b = gfx.read_text()
+
+# 1. Enable hive detection for IP 10.3.0, as in the original IFLB script.
+marker1 = 'MacPro2019LocalAI IFLB: enable Navi21 XGMI'
+if marker1 not in a:
+    if 'adev->gmc.xgmi.supported = true;' in a:
+        raise SystemExit('SOURCE DRIFT: upstream has another XGMI enablement path; manual review required')
+    needle = '\tgmc_v10_0_set_irq_funcs(adev);\n\tgmc_v10_0_set_umc_funcs(adev);\n\n'
+    if a.count(needle) != 1:
+        raise SystemExit('SOURCE DRIFT: gmc_v10_0.c init anchor changed')
+    add = ('\tgmc_v10_0_set_irq_funcs(adev);\n'
+           '\tgmc_v10_0_set_umc_funcs(adev);\n'
+           '\t/* MacPro2019LocalAI IFLB: enable Navi21 XGMI. */\n'
+           '\tif (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(10, 3, 0))\n'
+           '\t\tadev->gmc.xgmi.supported = true;\n\n')
+    a = a.replace(needle, add, 1)
+
+# Find a complete function using its braces, without replacing its existing
+# implementation. Abort if Ubuntu changes its structure or variable names.
+def locate_function(text, signature):
+    start = text.find(signature)
+    if start < 0 or text.count(signature) != 1:
+        raise SystemExit('SOURCE DRIFT: expected one function: ' + signature)
+    open_idx = text.find('{', start)
+    if open_idx < 0:
+        raise SystemExit('SOURCE DRIFT: missing function opening brace')
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise SystemExit('SOURCE DRIFT: unmatched function braces')
+
+# 2. Initialize framebuffer boundaries on XGMI hive nodes.
+# Ubuntu source can expose either the BASE-only helper (usual upstream) or a
+# BASE+TOP helper. Support both without replacing unrelated upstream code.
+fb_sig = 'static u64 gfxhub_v2_1_get_fb_location(struct amdgpu_device *adev)'
+s, e = locate_function(b, fb_sig)
+func = b[s:e]
+marker2 = 'MacPro2019LocalAI IFLB: hive framebuffer aperture'
+if marker2 not in func:
+    if 'adev->gmc.fb_start' in func or 'adev->gmc.fb_end' in func:
+        raise SystemExit('SOURCE DRIFT: framebuffer boundaries already assigned by upstream; review manually')
+    base_decl = 'u64 base = RREG32_SOC15(GC, 0, mmGCMC_VM_FB_LOCATION_BASE);'
+    base_mask = 'base &= GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK;'
+    base_shift = 'base <<= 24;'
+    top_decl = 'u64 top = RREG32_SOC15(GC, 0, mmGCMC_VM_FB_LOCATION_TOP);'
+    top_mask = 'top &= GCMC_VM_FB_LOCATION_TOP__FB_TOP_MASK;'
+    top_shift = 'top <<= 24;'
+    if any(func.count(token) != 1 for token in
+           (base_decl, base_mask, base_shift, 'return base;')):
+        raise SystemExit('SOURCE DRIFT: BASE register read/decode/return does not match the validated layout')
+    states = [token in func for token in (top_decl, top_mask, top_shift)]
+    if all(states):
+        print('IFLB_FB_LAYOUT=BASE_AND_TOP')
+    elif any(states) or 'mmGCMC_VM_FB_LOCATION_TOP' in func or 'u64 top' in func:
+        raise SystemExit('SOURCE DRIFT: unexpected or partial TOP register decoding; review manually')
+    else:
+        # The Ubuntu BASE-only helper has no TOP variable. Add exactly the
+        # TOP register decode used by the original working IFLB patch.
+        func = func.replace(base_decl,
+                            base_decl + '\n\tu64 top = RREG32_SOC15(GC, 0, mmGCMC_VM_FB_LOCATION_TOP);', 1)
+        func = func.replace(base_shift,
+                            base_shift + '\n\n\ttop &= GCMC_VM_FB_LOCATION_TOP__FB_TOP_MASK;\n\ttop <<= 24;', 1)
+        print('IFLB_FB_LAYOUT=BASE_ONLY_TOP_ADDED')
+    insertion = ('/* MacPro2019LocalAI IFLB: hive framebuffer aperture.\n'
+                 '\t * Preserve Ubuntu register decoding and initialize FB bounds.\n'
+                 '\t */\n'
+                 '\tadev->gmc.fb_start = base;\n'
+                 '\tadev->gmc.fb_end = top;\n'
+                 '\treturn base;')
+    func = func.replace('return base;', insertion, 1)
+    b = b[:s] + func + b[e:]
+
+# 3. Restore XGMI hive info function (original IFLB logic).
+xgmi_sig = 'static int gfxhub_v2_1_get_xgmi_info(struct amdgpu_device *adev)'
+marker3 = 'MacPro2019LocalAI IFLB: Sienna Cichlid XGMI hive discovery'
+if xgmi_sig not in b:
+    anchor = 'const struct amdgpu_gfxhub_funcs gfxhub_v2_1_funcs = {\n'
+    if b.count(anchor) != 1:
+        raise SystemExit('SOURCE DRIFT: gfxhub_v2_1 function table changed')
+    fn = '''/* MacPro2019LocalAI IFLB: Sienna Cichlid XGMI hive discovery. */
+static int gfxhub_v2_1_get_xgmi_info(struct amdgpu_device *adev)
+{
+\tu32 max_num_physical_nodes;
+\tu32 max_physical_node_id;
+\tu32 xgmi_lfb_cntl = RREG32_SOC15(GC, 0, mmGCMC_VM_XGMI_LFB_CNTL);
+\tu32 max_region =
+\t\tREG_GET_FIELD(xgmi_lfb_cntl, GCMC_VM_XGMI_LFB_CNTL, PF_MAX_REGION);
+\tu64 seg_size;
+\tswitch (adev->asic_type) {
+\tcase CHIP_SIENNA_CICHLID:
+\t\tmax_num_physical_nodes = 4;
+\t\tmax_physical_node_id = 3;
+\t\tbreak;
+\tdefault:
+\t\treturn -EINVAL;
+\t}
+\t/* PF_MAX_REGION == 0 means XGMI is disabled. */
+\tif (max_region) {
+\t\tadev->gmc.xgmi.num_physical_nodes = max_region + 1;
+\t\tif (adev->gmc.xgmi.num_physical_nodes > max_num_physical_nodes)
+\t\t\treturn -EINVAL;
+\t\tadev->gmc.xgmi.physical_node_id =
+\t\t\tREG_GET_FIELD(xgmi_lfb_cntl, GCMC_VM_XGMI_LFB_CNTL, PF_LFB_REGION);
+\t\tif (adev->gmc.xgmi.physical_node_id > max_physical_node_id)
+\t\t\treturn -EINVAL;
+\t\t/* Explicit 64-bit shift avoids overflow for large hive windows. */
+\t\tseg_size = ((u64)REG_GET_FIELD(
+\t\t\tRREG32_SOC15(GC, 0, mmGCMC_VM_XGMI_LFB_SIZE),
+\t\t\tGCMC_VM_XGMI_LFB_SIZE, PF_LFB_SIZE)) << 24;
+\t\tadev->gmc.xgmi.node_segment_size = seg_size;
+\t\tdev_info(adev->dev,
+\t\t\t"XGMI: node %u of %u-node hive detected\\n",
+\t\t\tadev->gmc.xgmi.physical_node_id,
+\t\t\tadev->gmc.xgmi.num_physical_nodes);
+\t}
+\treturn 0;
+}
+
+'''
+    b = b.replace(anchor, fn + anchor, 1)
+else:
+    if marker3 not in b:
+        raise SystemExit('SOURCE DRIFT: upstream XGMI function exists; inspect before altering')
+
+# 4. Connect the restored callback to the gfxhub dispatch table.
+hook = '.get_xgmi_info = gfxhub_v2_1_get_xgmi_info,'
+if hook not in b:
+    needle = '\t.halt = gfxhub_v2_1_halt,\n};'
+    if b.count(needle) != 1:
+        raise SystemExit('SOURCE DRIFT: gfxhub_v2_1 hook position changed')
+    b = b.replace(needle, '\t.halt = gfxhub_v2_1_halt,\n\t' + hook + '\n};', 1)
+
+# Write only after all four checks have succeeded.
+for token in (marker1, 'adev->gmc.xgmi.supported = true;'):
+    if token not in a:
+        raise SystemExit('IFLB gmc final marker missing: ' + token)
+for token in (marker2, marker3, hook, 'adev->gmc.fb_start = base;',
+              'adev->gmc.fb_end = top;'):
+    if token not in b:
+        raise SystemExit('IFLB gfxhub final marker missing: ' + token)
+gmc.write_text(a)
+gfx.write_text(b)
+print('IFLB_PATCH=PASS')
+IFLB_PY
+ok 'IFLB: XGMI enablement + framebuffer aperture + hive discovery + hook'
+
+# ----------------------------------------------------------------------------
+# STEP 3: PCI-BAR fix chain. Pinned upstream commit identities, in the exact
+# order used by the original production PCI-BAR installer.
+# ----------------------------------------------------------------------------
+banner 'STEP 3: PCI bridge window / BAR allocation repairs'
+STEP='PCI upstream patch chain'
+for needle in 'optional size shrunken' 'if (r_size <= align)' \
+              'if (!res_to_dev_res(head, res))'; do
+    grep -Fq "$needle" drivers/pci/setup-bus.c ||
+        die "PCI baseline source drift (missing: $needle)"
+done
+
+pci_final_markers() {
+    grep -Fq '__resource_contains_unbound' kernel/resource.c &&
+    grep -Fq 'full_avail' kernel/resource.c &&
+    grep -Fq 'pci_min_window_alignment' drivers/pci/setup-bus.c &&
+    grep -Fq 'pci_align_resource' drivers/pci/setup-res.c &&
+    grep -Fq 'if (!dev->io_window)' drivers/pci/probe.c &&
+    grep -Fq 'if (!dev->pref_window)' drivers/pci/probe.c
+}
+
+if pci_final_markers; then
+    info 'PCI infrastructure fixes already present in Ubuntu source; no patch replay'
+    printf '%s\n' 'PCI_FIXES=ALREADY_PRESENT' >> "$BASE/manifest.txt"
+else
+    PATCH_COMMITS=(
+        92427ab4 edfaa81d f699bcc8 66475b5d 0734cb24
+        4dd6e1aa 3fa40d30 38ec53e1 8bbe8cec 9036bd0e
+    )
+    for sha in "${PATCH_COMMITS[@]}"; do
+        patch="$PATCH_DIR/$sha.patch"
+        curl -fsSL --retry 3 --retry-delay 2 \
+            "https://github.com/torvalds/linux/commit/$sha.patch" \
+            -o "$patch" || die "Could not download upstream PCI patch $sha"
+        [[ -s "$patch" ]] || die "Empty upstream PCI patch: $sha"
+        if git apply --check "$patch" > "$BASE/pci-$sha.log" 2>&1; then
+            git apply "$patch" || die "Failed applying upstream PCI patch $sha"
+            printf 'PCI_%s=APPLIED\n' "$sha" >> "$BASE/manifest.txt"
+        elif git apply --reverse --check "$patch" > "$BASE/pci-$sha.log" 2>&1; then
+            printf 'PCI_%s=ALREADY_PRESENT\n' "$sha" >> "$BASE/manifest.txt"
+        else
+            tail -n 12 "$BASE/pci-$sha.log" >&2
+            die "PCI patch $sha conflicts with Ubuntu $SOURCE_VER. STOP: manual rebase required."
+        fi
+    done
+    pci_final_markers || die 'PCI patch-chain markers missing after patch application'
+    ok '10 upstream PCI fixes applied or verified'
+fi
+
+# Separate child bridge alignment fix originally used on the 8x V620 system.
+STEP='PCI child bridge alignment'
+python3 - <<'PCI_ALIGN_PY'
+from pathlib import Path
+p = Path('drivers/pci/setup-bus.c')
+s = p.read_text()
+old = 'size += max(r_size, align);'
+new = 'size += ALIGN(r_size, align);'
+if s.count(new) == 1 and old not in s:
+    print('PCI_CHILD_WINDOW_ALIGNMENT=ALREADY_PRESENT')
+elif s.count(old) == 1 and new not in s:
+    p.write_text(s.replace(old, new, 1))
+    print('PCI_CHILD_WINDOW_ALIGNMENT=APPLIED')
+else:
+    raise SystemExit('SOURCE DRIFT: cannot safely identify PCI child window alignment expression')
+PCI_ALIGN_PY
+
+# Retain the normal SR-IOV path; do not suppress it and never create VFs.
+STEP='SR-IOV source preflight'
+for needle in \
+    'pci_read_config_word(dev, pos + PCI_SRIOV_CTRL, &ctrl);' \
+    'pci_read_config_word(dev, pos + PCI_SRIOV_TOTAL_VF, &total);'; do
+    grep -Fq "$needle" drivers/pci/iov.c || die "Normal SR-IOV code missing: $needle"
+done
+if grep -Eq 'LinuxAI V620 bare-metal SR-IOV suppression|ignoring SR-IOV for Radeon PRO V620' \
+   drivers/pci/iov.c; then
+    die 'Unexpected historical V620 SR-IOV suppression patch found'
+fi
+ok 'PCI-BAR / alignment and normal SR-IOV semantics verified'
+
+# ----------------------------------------------------------------------------
+# STEP 4: Unique local ABI. Never reuse stock or known custom kernel names.
+# ----------------------------------------------------------------------------
+banner 'STEP 4: Generate a unique MacPro2019LocalAI kernel ABI'
+STEP='unique Ubuntu ABI preparation'
+CHANGELOG='debian.master/changelog'
+ORIGINAL_VERSION="$(dpkg-parsechangelog -l "$CHANGELOG" -S Version)"
+if [[ "$ORIGINAL_VERSION" =~ ^(7\.0\.0)-([0-9]+)\.(.+)$ ]]; then
+    UPSTREAM="${BASH_REMATCH[1]}"
+    STOCK_ABI="${BASH_REMATCH[2]}"
+    VERSION_TAIL="${BASH_REMATCH[3]}"
+else
+    die "Unexpected Ubuntu kernel changelog version: $ORIGINAL_VERSION"
+fi
+(( ABI_NUM = 4000 + 10#$STOCK_ABI ))
+while :; do
+    KREL="${UPSTREAM}-${ABI_NUM}-${FLAVOUR}"
+    HDRBASE="${UPSTREAM}-${ABI_NUM}"
+    if [[ ! -e "/boot/vmlinuz-$KREL" ]] &&
+       ! dpkg-query -W "linux-image-unsigned-$KREL" >/dev/null 2>&1; then
+        break
+    fi
+    ((ABI_NUM+=1000))
+    (( ABI_NUM < 20000 )) || die 'Could not find an unused custom Ubuntu ABI'
+done
+NEW_VERSION="${UPSTREAM}-${ABI_NUM}.${VERSION_TAIL}+${LOCAL_SUFFIX}"
+CHANGELOG="$CHANGELOG" NEW_VERSION="$NEW_VERSION" python3 - <<'CHANGELOG_PY'
+from pathlib import Path
+import os, re
+p = Path(os.environ['CHANGELOG'])
+lines = p.read_text().splitlines()
+if not lines:
+    raise SystemExit('Kernel changelog empty')
+updated, count = re.subn(r'\([^)]*\)', '(' + os.environ['NEW_VERSION'] + ')', lines[0], count=1)
+if count != 1 or not updated.startswith('linux ('):
+    raise SystemExit('Ubuntu kernel changelog format changed')
+lines[0] = updated
+p.write_text('\n'.join(lines) + '\n')
+CHANGELOG_PY
+[[ "$(dpkg-parsechangelog -l "$CHANGELOG" -S Version)" == "$NEW_VERSION" ]] ||
+    die 'Custom Debian package version not applied'
+info "Custom kernel: $KREL"
+info "Debian version: $NEW_VERSION"
+printf 'CUSTOM_KERNEL=%s\nPACKAGE_VERSION=%s\n' "$KREL" "$NEW_VERSION" >> "$BASE/manifest.txt"
+
+# Ubuntu's generated binary package stanzas may still have the stock ABI
+# after an initial clean. Regenerate them explicitly with the new changelog.
+STEP='regenerate custom ABI Debian control stanzas'
+if ! fakeroot debian/rules debian/control > "$BASE/control-generation.log" 2>&1; then
+    tail -n 20 "$BASE/control-generation.log" >&2
+    die 'Ubuntu Debian control regeneration failed after changing ABI'
+fi
+[[ -f debian/control ]] || die 'Generated debian/control missing'
+for wanted in "linux-modules-$KREL" "linux-image-unsigned-$KREL" "linux-headers-$KREL"; do
+    grep -Fxq "Package: $wanted" debian/control ||
+        die "Generated debian/control does not define: $wanted"
+done
+if grep -Fq "Package: linux-modules-$STOCK_KREL" debian/control; then
+    die 'Generated Debian control still contains the unmodified stock ABI'
+fi
+ok 'Ubuntu package control regenerated for unique custom ABI'
+
+# ----------------------------------------------------------------------------
+# STEP 5: Build. Guard against unbounded/recursive logging: ONE redirected
+# logfile, no nested tee/process substitution and no loop appending to itself.
+# ----------------------------------------------------------------------------
+banner 'STEP 5: Compile complete Ubuntu generic kernel packages'
+STEP='kernel compilation'
+require_tool fakeroot
+require_tool dpkg-deb
+# Ubuntu's kernel Makefile has `RUSTC = rustc`: exporting RUSTC alone
+# is NOT sufficient, because a Makefile variable overrides the environment.
+# Use the correct unversioned rustc/clang executable names via a private PATH
+# (without replacing system alternatives or making permanent changes).
+RUSTC_193="$(readlink -f /usr/bin/rustc-1.93)"
+[[ -x "$RUSTC_193" ]] || die 'Pinned rustc-1.93 executable is missing'
+[[ -x /usr/lib/llvm-21/bin/clang ]] || die 'Pinned clang-21 executable is missing'
+if [[ "$(basename "$RUSTC_193")" == 'rustc' ]]; then
+    RUST_BIN="$(dirname "$RUSTC_193")"
+else
+    # Some distributions expose only rustc-1.93; create a private alias.
+    RUST_BIN="$BASE/rust-toolchain-bin"
+    mkdir -p "$RUST_BIN"
+    ln -s "$RUSTC_193" "$RUST_BIN/rustc"
+fi
+export PATH="$RUST_BIN:/usr/lib/llvm-21/bin:$PATH"
+export RUSTC="$RUSTC_193"
+export HOSTRUSTC="$RUSTC_193"
+export LIBCLANG_PATH=/usr/lib/llvm-21/lib
+export CLANG_PATH=/usr/lib/llvm-21/bin/clang
+if [[ -x /usr/lib/rust-1.93/bin/rustfmt ]]; then
+    export RUSTFMT=/usr/lib/rust-1.93/bin/rustfmt
+fi
+if [[ -d /usr/src/rustc-1.93.1/library ]]; then
+    export RUST_LIB_SRC=/usr/src/rustc-1.93.1/library
+fi
+# Fail BEFORE the multi-hour build if Make's bare rustc/clang names still
+# resolve to a newer Ubuntu toolchain. Never turn off check-config or Rust.
+RUST_VERSION="$(rustc --version | awk '{print $2}')"
+RUST_LLVM="$(rustc -vV | awk '$1=="LLVM" && $2=="version:" {print $3}')"
+CLANG_VERSION="$(clang --version | awk 'NR==1 {print}')"
+info "Selected Rust: $(command -v rustc) ($RUST_VERSION; LLVM $RUST_LLVM)"
+info "Selected Clang: $CLANG_VERSION"
+[[ "$RUST_VERSION" == '1.93.1' && "$RUST_LLVM" == '21.1.8' ]] ||
+    die 'Rust/LLVM mismatch: expected rustc 1.93.1 with LLVM 21.1.8'
+[[ "$CLANG_VERSION" == *'version 21.'* ]] ||
+    die 'Clang mismatch: expected LLVM/Clang 21'
+export DEBFULLNAME="${MAINTAINER} (${PROJECT})"
+export DEBEMAIL='faisalbiyari@localhost'
+CPU_COUNT="$(nproc)"
+MEM_TOTAL_KIB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+JOBS=$((MEM_TOTAL_KIB/2621440))
+(( JOBS < 1 )) && JOBS=1
+(( JOBS > CPU_COUNT )) && JOBS=$CPU_COUNT
+(( JOBS > 16 )) && JOBS=16
+export DEB_BUILD_OPTIONS="parallel=$JOBS"
+BUILD_LOG="$BASE/build-${KREL}.log"
+info "Kernel build jobs: $JOBS | Toolchain: rustc-1.93 / clang-21"
+info "Build log: $BUILD_LOG (capped at 32 MiB; keeps recent output)"
+# A stream-draining logger with a bounded file, avoiding the 229 GB recursive
+# tee/log-growth problem observed during previous kernel builds. PIPESTATUS
+# retains the REAL fakeroot build exit code; no swallowed failures.
+set +e
+fakeroot debian/rules binary-headers binary-generic binary-perarch 2>&1 | \
+    python3 -u -c '
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+max_bytes, keep_bytes = 32 * 1024 * 1024, 16 * 1024 * 1024
+with path.open("w+b", buffering=0) as log:
+    while True:
+        data = sys.stdin.buffer.read(65536)
+        if not data:
+            break
+        log.write(data)
+        if log.tell() > max_bytes:
+            log.seek(-keep_bytes, 2)
+            tail = log.read(keep_bytes)
+            log.seek(0)
+            log.write(b"[Older kernel build output truncated at 32 MiB]\n")
+            log.write(tail)
+            log.truncate()
+' "$BUILD_LOG"
+BUILD_PIPE_STATUS=("${PIPESTATUS[@]}")
+set -e
+if (( BUILD_PIPE_STATUS[0] != 0 || BUILD_PIPE_STATUS[1] != 0 )); then
+    tail -n 35 "$BUILD_LOG" >&2
+    die "Kernel compilation failed: build=${BUILD_PIPE_STATUS[0]} logger=${BUILD_PIPE_STATUS[1]}; log: $BUILD_LOG"
+fi
+ok 'Ubuntu kernel packages built'
+
+find_package() {
+    local wanted="$1" deb name
+    while IFS= read -r deb; do
+        name="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+        if [[ "$name" == "$wanted" ]]; then
+            printf '%s\n' "$deb"
+            return 0
+        fi
+    done < <(find "$BASE" -maxdepth 1 -type f -name '*.deb' -print | sort)
+    return 1
+}
+
+H_COMMON="$(find_package "linux-headers-$HDRBASE")" || die 'Common headers .deb missing'
+H_GENERIC="$(find_package "linux-headers-$KREL")" || die 'Generic headers .deb missing'
+MODULES="$(find_package "linux-modules-$KREL")" || die 'Kernel modules .deb missing'
+IMAGE="$(find_package "linux-image-unsigned-$KREL")" || die 'Unsigned image .deb missing'
+LIB_RUST="$(find_package "linux-lib-rust-$KREL")" || die 'Kernel Rust library .deb missing'
+for deb in "$H_COMMON" "$H_GENERIC" "$MODULES" "$IMAGE" "$LIB_RUST"; do
+    [[ -s "$deb" ]] && dpkg-deb --info "$deb" >/dev/null || die "Invalid kernel package: $deb"
+done
+
+# Remove ONLY the impossible dependency on a matching signed ZFS kernel module
+# from the CUSTOM modules .deb. This is not a general ZFS removal.
+STEP='custom modules dependency normalization'
+ZFS_DEP="linux-main-modules-zfs-$KREL"
+DEPS="$(dpkg-deb -f "$MODULES" Depends 2>/dev/null || true)"
+if [[ "$DEPS" == *"$ZFS_DEP"* ]]; then
+    REPACK="$BASE/modules-deb-repack"
+    mkdir -p "$REPACK"
+    dpkg-deb -R "$MODULES" "$REPACK" > "$BASE/repack-extract.log" 2>&1 ||
+        die 'Cannot unpack custom modules .deb for dependency normalization'
+    CONTROL="$REPACK/DEBIAN/control"
+    CONTROL="$CONTROL" ZFS_DEP="$ZFS_DEP" python3 - <<'ZFS_PY'
+from pathlib import Path
+import os
+p = Path(os.environ['CONTROL'])
+lines = p.read_text().splitlines()
+found = False
+for index, line in enumerate(lines):
+    if not line.startswith('Depends:'):
+        continue
+    parts = [item.strip() for item in line.split(':', 1)[1].split(',')]
+    kept = []
+    for part in parts:
+        if part.split(' ', 1)[0] == os.environ['ZFS_DEP']:
+            found = True
+        elif part:
+            kept.append(part)
+    lines[index] = 'Depends: ' + ', '.join(kept)
+if not found:
+    raise SystemExit('Versioned ZFS dependency not found where expected')
+p.write_text('\n'.join(lines) + '\n')
+ZFS_PY
+    MODULES_NORMALIZED="$BASE/linux-modules-${KREL}-without-custom-zfs-dep.deb"
+    dpkg-deb --root-owner-group --build "$REPACK" "$MODULES_NORMALIZED" \
+        > "$BASE/repack-build.log" 2>&1 || die 'Custom modules .deb rebuild failed'
+    [[ "$(dpkg-deb -f "$MODULES_NORMALIZED" Depends 2>/dev/null || true)" != *"$ZFS_DEP"* ]] ||
+        die 'Versioned custom ZFS dependency remains'
+    MODULES="$MODULES_NORMALIZED"
+    ok 'Removed only the unattainable custom-ABI ZFS dependency'
+else
+    info 'No custom-ABI ZFS dependency was present'
+fi
+
+# All AMDGPU modifications must still be in the final source before install.
+for pattern in \
+    'MacPro2019LocalAI IFLB: enable Navi21 XGMI' \
+    'adev->gmc.xgmi.supported = true;'; do
+    grep -Fq "$pattern" drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c ||
+        die 'IFLB patch missing after build'
+done
+grep -Fq 'MacPro2019LocalAI IFLB: Sienna Cichlid XGMI hive discovery' \
+    drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c || die 'IFLB gfxhub patch missing after build'
+grep -Fq 'size += ALIGN(r_size, align);' drivers/pci/setup-bus.c ||
+    die 'PCI child window fix missing after build'
+
+printf '%s\n' "PACKAGE_HEADERS=$(basename "$H_COMMON")" \
+    "PACKAGE_HEADERS_GENERIC=$(basename "$H_GENERIC")" \
+    "PACKAGE_MODULES=$(basename "$MODULES")" \
+    "PACKAGE_IMAGE=$(basename "$IMAGE")" \
+    "PACKAGE_RUST=$(basename "$LIB_RUST")" >> "$BASE/manifest.txt"
+ok 'Five required kernel packages and source patch markers verified'
+
+if [[ "$MODE" == build-only ]]; then
+    banner 'BUILD-ONLY COMPLETE - NOTHING INSTALLED, NO GRUB CHANGE'
+    info "Custom kernel: $KREL"
+    info "Workspace: $BASE"
+    info "Manifest: $BASE/manifest.txt"
+    info 'Build-only mode requested; rerun without --build-only to install and test.'
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------
+# STEP 6: install all five packages, preserve BOTH fallback kernels, build Apple DKMS.
+# ----------------------------------------------------------------------------
+banner 'STEP 6: Install custom packages while preserving rescue kernels'
+STEP='preserve rescue kernel'
+[[ -s "/boot/vmlinuz-$STOCK_KREL" && -s "/boot/initrd.img-$STOCK_KREL" ]] || {
+    info "Installing official rescue kernel $STOCK_KREL via linux-generic"
+    sudo apt-get install -y linux-generic > "$BASE/stock-kernel.log" 2>&1 ||
+        die 'Could not install official stock fallback kernel'
+}
+[[ -s "/boot/vmlinuz-$STOCK_KREL" && -s "/boot/initrd.img-$STOCK_KREL" ]] ||
+    die "Official fallback kernel boot files missing: $STOCK_KREL"
+
+STEP='kernel package installation'
+if ! sudo dpkg -i "$H_COMMON" "$H_GENERIC" "$MODULES" "$IMAGE" "$LIB_RUST" \
+    > "$BASE/install.log" 2>&1; then
+    tail -n 30 "$BASE/install.log" >&2
+    die 'Kernel installation failed. No automatic apt -f recovery or GRUB default change.'
+fi
+sudo depmod -a "$KREL" || die 'depmod failed'
+AMDGPU_KO="$(find "/lib/modules/$KREL" -type f -name 'amdgpu.ko*' -print -quit)"
+[[ -n "$AMDGPU_KO" ]] || die 'The new kernel lacks an installed amdgpu module'
+
+STEP='Apple T2 DKMS checks'
+if command -v dkms >/dev/null 2>&1; then
+    if ! sudo dkms autoinstall -k "$KREL" > "$BASE/dkms.log" 2>&1; then
+        tail -n 20 "$BASE/dkms.log" >&2
+        die 'DKMS rebuild failed; do not switch GRUB until fixed'
+    fi
+    for module in apple-bce applesmc-t2; do
+        if dkms status | grep -q "^$module/"; then
+            dkms status -k "$KREL" | grep -Eq "^$module/.*installed" ||
+                die "Installed $module DKMS source is not built for $KREL"
+        else
+            warn "$module DKMS is not installed; review Apple T2 requirements before boot"
+        fi
+    done
+fi
+
+
+STEP='regenerate final initramfs with Apple DKMS modules'
+if [[ -e "/boot/initrd.img-$KREL" ]]; then
+    sudo update-initramfs -u -k "$KREL" > "$BASE/initramfs.log" 2>&1 ||
+        die 'Initramfs regeneration failed'
+else
+    sudo update-initramfs -c -k "$KREL" > "$BASE/initramfs.log" 2>&1 ||
+        die 'Initramfs creation failed'
+fi
+[[ -s "/boot/vmlinuz-$KREL" && -s "/boot/initrd.img-$KREL" &&
+   -d "/lib/modules/$KREL" ]] || die 'Installed kernel boot files missing'
+STEP='kernel package holds'
+HOLD_PKGS=(
+    "linux-headers-$HDRBASE"
+    "linux-headers-$KREL"
+    "linux-modules-$KREL"
+    "linux-image-unsigned-$KREL"
+    "linux-lib-rust-$KREL"
+)
+sudo apt-mark hold "${HOLD_PKGS[@]}" > "$BASE/holds.log" || die 'Package hold failed'
+for pkg in "${HOLD_PKGS[@]}"; do
+    [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null)" == 'hold ok installed' ]] ||
+        die "Package not fully installed and held: $pkg"
+done
+ok 'Five kernel packages installed and held'
+
+# ----------------------------------------------------------------------------
+# STEP 7: Install an automatic one-shot boot verifier. This helper is GENERATED
+# by the one distributed installer file; there is no second downloaded script.
+# The helper PROMOTES the new kernel only after first-boot checks pass.
+# ----------------------------------------------------------------------------
+banner 'STEP 7: Prepare automatic first-boot verification'
+STEP='automatic verification helper installation'
+STATE_DIR='/var/lib/macpro2019localai'
+VERIFY_HELPER='/usr/local/sbin/macpro2019localai-postboot-verify'
+VERIFY_SERVICE='macpro2019localai-postboot-verify.service'
+
+cat > "$BASE/postboot-verify.sh" <<'POSTBOOT_HELPER'
+#!/usr/bin/env bash
+# MacPro2019LocalAI / FaisalBiyari - local, one-shot first-boot verifier.
+# Generated by the all-in-one kernel installer; no internet/network needed.
+set -Eeuo pipefail
+export LC_ALL=C
+umask 077
+
+PROJECT='MacPro2019LocalAI'
+STATE='/var/lib/macpro2019localai'
+PENDING="$STATE/pending.conf"
+LOG="$STATE/last-verification.log"
+SERVICE='macpro2019localai-postboot-verify.service'
+ACS_TARGETS="$STATE/acs-targets.tsv"
+GPU_INVENTORY="$STATE/gpu-inventory.tsv"
+[[ -s "$PENDING" ]] || exit 0
+exec > "$LOG" 2>&1
+
+read_field() { sed -n "s/^$1=//p" "$PENDING" | awk 'NR==1 {print}'; }
+KREL="$(read_field CUSTOM_KERNEL)"
+RESCUE="$(read_field RESCUE_KERNEL)"
+EXPECTED_GPU_COUNT="$(read_field EXPECTED_GPU_COUNT)"
+EXPECTED_ALL_GPU_COUNT="$(read_field EXPECTED_ALL_GPU_COUNT)"
+EXPECTED_ROCM_COUNT="$(read_field EXPECTED_ROCM_COUNT)"
+ACS_TARGET_COUNT="$(read_field ACS_TARGET_COUNT)"
+ACS_RUNTIME="$(read_field ACS_RUNTIME)"
+
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if (( rc != 0 )); then
+        echo "FIRST_BOOT_VERIFICATION=FAIL exit=$rc"
+        echo "SAFE_FALLBACK=$RESCUE"
+        echo 'The working kernel remains the GRUB default; no automatic reboot.'
+        # Restore ORIGINAL kernel flags after a failed trial, including any
+        # previous ACS setting. Force the last working kernel as the default.
+        if [[ -f "$STATE/grub.original-before-trial.bak" ]]; then
+            cp -a "$STATE/grub.original-before-trial.bak" /etc/default/grub || true
+            sed -i -E 's|^GRUB_DEFAULT=.*$|GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux '"$RESCUE"'"|' /etc/default/grub || true
+            update-grub > "$STATE/grub-failed-trial-restore.log" 2>&1 || true
+        fi
+        cp -a "$PENDING" "$STATE/failed.conf" 2>/dev/null || true
+        rm -f "$PENDING" 2>/dev/null || true
+        grub-editenv /boot/grub/grubenv unset next_entry 2>/dev/null || true
+        systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    exit "$rc"
+}
+trap on_exit EXIT
+fail() { echo "FAIL: $*"; exit 1; }
+
+echo '=== MacPro2019LocalAI / FaisalBiyari - automatic first-boot verification ==='
+echo "EXPECTED_KERNEL=$KREL"
+echo "RESCUE_KERNEL=$RESCUE"
+[[ "$KREL" =~ ^7\.0\.0-[0-9]+-generic$ ]] || fail 'Invalid custom kernel in pending state'
+[[ "$RESCUE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]] || fail 'Invalid rescue kernel in pending state'
+[[ "$EXPECTED_GPU_COUNT" =~ ^[0-9]+$ &&
+   "$EXPECTED_ALL_GPU_COUNT" =~ ^[0-9]+$ && "$EXPECTED_ROCM_COUNT" =~ ^[0-9]+$ &&
+   "$ACS_TARGET_COUNT" =~ ^[0-9]+$ ]] ||
+    fail 'Invalid expected counts'
+[[ -r "$ACS_TARGETS" ]] || fail 'Dynamic ACS bridge manifest missing'
+[[ "$(wc -l < "$ACS_TARGETS")" -eq "$ACS_TARGET_COUNT" ]] || fail 'ACS manifest count mismatch'
+[[ -r "$GPU_INVENTORY" ]] || fail 'PCIe GPU baseline inventory missing'
+[[ "$(wc -l < "$GPU_INVENTORY")" -eq "$EXPECTED_ALL_GPU_COUNT" ]] ||
+    fail 'PCI GPU baseline snapshot count mismatch'
+[[ "$(uname -r)" == "$KREL" ]] || fail "Booted wrong kernel: $(uname -r)"
+[[ -s "/boot/vmlinuz-$KREL" && -s "/boot/initrd.img-$KREL" ]] || fail 'New kernel boot files missing'
+[[ -s "/boot/vmlinuz-$RESCUE" && -s "/boot/initrd.img-$RESCUE" ]] || fail 'Fallback kernel boot files missing'
+grep -Eq '(^| )iommu=pt( |$)' /proc/cmdline || fail 'iommu=pt is not active'
+if (( ACS_TARGET_COUNT > 0 )); then
+    grep -Fq "$ACS_RUNTIME" /proc/cmdline || fail 'Dynamic ACS redirect override is not active'
+elif grep -Fq 'pci=disable_acs_redir=' /proc/cmdline; then
+    fail 'Unexpected ACS override when no eligible GPU-only bridge was selected'
+fi
+
+echo '=== PCI GPU BAR / AMDGPU binding ==='
+get_gpu_ids() { lspci -Dn -d 1002: | awk '$2 ~ /^03/ {print $1}'; }
+CURRENT_GPU_COUNT="$(get_gpu_ids | wc -l)"
+CURRENT_ALL_GPU_COUNT="$(lspci -Dn | awk '$2 ~ /^03/ {n++} END{print n+0}')"
+echo "ALL_GPU_COUNT=$CURRENT_ALL_GPU_COUNT/$EXPECTED_ALL_GPU_COUNT"
+echo "AMD_GPU_COUNT=$CURRENT_GPU_COUNT/$EXPECTED_GPU_COUNT"
+[[ "$CURRENT_GPU_COUNT" -eq "$EXPECTED_GPU_COUNT" &&
+   "$CURRENT_ALL_GPU_COUNT" -eq "$EXPECTED_ALL_GPU_COUNT" ]] || fail 'GPU inventory changed after boot'
+
+# Compare ALL GPU identities, and preserve pre-existing non-AMD GPU drivers.
+# If the PCI bus numbers changed, don't trust the preboot ACS BDF selectors.
+GPU_IDENTITIES_OK=0
+while IFS=$'\t' read -r bdf old_vendor old_device old_driver; do
+    sys="/sys/bus/pci/devices/$bdf"
+    [[ -r "$sys/vendor" && -r "$sys/device" ]] || fail "GPU bus renumbered or removed: $bdf"
+    [[ "$(cat "$sys/vendor")" == "$old_vendor" &&
+       "$(cat "$sys/device")" == "$old_device" ]] ||
+        fail "GPU PCI hardware identity changed at $bdf"
+    if [[ "$old_vendor" != '0x1002' && "$old_driver" != none ]]; then
+        [[ -L "$sys/driver" &&
+           "$(basename "$(readlink -f "$sys/driver")")" == "$old_driver" ]] ||
+            fail "Non-AMD GPU driver regressed: $bdf $old_driver"
+    fi
+    GPU_IDENTITIES_OK=$((GPU_IDENTITIES_OK+1))
+done < "$GPU_INVENTORY"
+(( GPU_IDENTITIES_OK == EXPECTED_ALL_GPU_COUNT )) || fail 'GPU identity coverage incomplete'
+echo "PCI_GPU_IDENTITIES_VERIFIED=$GPU_IDENTITIES_OK/$EXPECTED_ALL_GPU_COUNT"
+
+BOUND=0
+BARS=0
+for attempt in 1 2 3 4 5 6 7 8; do
+    BOUND=0
+    BARS=0
+    while read -r bdf; do
+        [[ -n "$bdf" ]] || continue
+        sys="/sys/bus/pci/devices/$bdf"
+        if [[ -L "$sys/driver" ]] &&
+           [[ "$(basename "$(readlink -f "$sys/driver")")" == amdgpu ]]; then
+            BOUND=$((BOUND+1))
+        fi
+        if [[ -r "$sys/resource" ]]; then
+            read -r begin end flags < "$sys/resource"
+            if (( begin != 0 && end >= begin )); then BARS=$((BARS+1)); fi
+        fi
+    done < <(get_gpu_ids)
+    if (( BOUND == EXPECTED_GPU_COUNT && BARS == EXPECTED_GPU_COUNT )); then break; fi
+    sleep 5
+done
+echo "AMDGPU_BOUND=$BOUND/$EXPECTED_GPU_COUNT"
+echo "BAR0_ASSIGNED=$BARS/$EXPECTED_GPU_COUNT"
+(( BOUND == EXPECTED_GPU_COUNT && BARS == EXPECTED_GPU_COUNT )) ||
+    fail 'amdgpu binding or PCI BAR0 allocation incomplete'
+
+ACTIVE_VFS=0
+while read -r bdf; do
+    [[ -n "$bdf" ]] || continue
+    sf="/sys/bus/pci/devices/$bdf/sriov_numvfs"
+    if [[ -r "$sf" ]]; then
+        value="$(cat "$sf")"
+        [[ "$value" =~ ^[0-9]+$ ]] || fail "Bad VF count on $bdf"
+        ACTIVE_VFS=$((ACTIVE_VFS+value))
+    fi
+done < <(lspci -Dn | awk '$2 ~ /^03/ {print $1}')
+echo "ACTIVE_GPU_VFS=$ACTIVE_VFS"
+(( ACTIVE_VFS == 0 )) || fail 'Unexpected active SR-IOV VFs'
+
+echo '=== Dynamic GPU-only PCIe ACS redirection ==='
+ACS_COUNT=0
+ACS_DISABLED=0
+while IFS=$'\t' read -r bdf expected_vendor expected_device; do
+    [[ -n "$bdf" ]] || continue
+    [[ "$bdf" =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ &&
+       "$expected_vendor" =~ ^[[:xdigit:]]{4}$ &&
+       "$expected_device" =~ ^[[:xdigit:]]{4}$ ]] || fail 'Invalid selected bridge row'
+    sys="/sys/bus/pci/devices/$bdf"
+    [[ -r "$sys/vendor" && -r "$sys/device" ]] || fail "ACS bridge vanished or bus renumbered: $bdf"
+    [[ "$(cat "$sys/vendor")" == "0x$expected_vendor" &&
+       "$(cat "$sys/device")" == "0x$expected_device" ]] ||
+       fail "ACS bridge hardware mismatch at $bdf (changed PCI numbering?)"
+    control="$(lspci -vv -s "$bdf" 2>/dev/null | grep 'ACSCtl:' || true)"
+    ACS_COUNT=$((ACS_COUNT+1))
+    if [[ "$control" == *'ReqRedir-'* && "$control" == *'CmpltRedir-'* ]]; then
+        ACS_DISABLED=$((ACS_DISABLED+1))
+    else
+        fail "ACS redirect is active or inaccessible at selected bridge: $bdf"
+    fi
+done < "$ACS_TARGETS"
+echo "ACS_REDIRECTION_DISABLED=$ACS_DISABLED/$ACS_COUNT"
+(( ACS_COUNT == ACS_TARGET_COUNT && ACS_COUNT == ACS_DISABLED )) ||
+    fail 'Selected ACS bridge verification incomplete'
+(( ACS_COUNT > 0 )) || echo 'ACS_MODE=NONE (no eligible GPU-only bridge group)'
+echo 'P2P_CORRECTNESS=NOT_TESTED (ACS state alone is not proof)'
+
+if command -v rocm-smi >/dev/null 2>&1; then
+    echo '=== ROCm initialization ==='
+    ROCM_COUNT=0
+    for attempt in 1 2 3 4 5 6; do
+        ROCM_COUNT="$(timeout 20s rocm-smi -i 2>/dev/null | grep -c 'Device Name:' || true)"
+        [[ "$ROCM_COUNT" =~ ^[0-9]+$ ]] || ROCM_COUNT=0
+        (( ROCM_COUNT == EXPECTED_GPU_COUNT )) && break
+        sleep 5
+    done
+    echo "ROCM_GPU_COUNT=$ROCM_COUNT (baseline=$EXPECTED_ROCM_COUNT; AMD_GPUS=$EXPECTED_GPU_COUNT)"
+    (( ROCM_COUNT >= EXPECTED_ROCM_COUNT )) || fail 'ROCm GPU count regressed compared with working kernel'
+    echo '=== ROCm peer-access report (accessibility, not transfer correctness) ==='
+    timeout 30s rocm-smi --showtopoaccess 2>&1 | grep -E '^GPU[0-9]+[[:space:]]' || true
+else
+    echo 'ROCM_GPU_COUNT=NOT_CHECKED (rocm-smi unavailable)'
+fi
+
+if command -v dkms >/dev/null 2>&1; then
+    echo '=== Apple DKMS ==='
+    for module in apple-bce applesmc-t2; do
+        if dkms status 2>/dev/null | grep -q "^$module/"; then
+            dkms status -k "$KREL" | grep -Eq "^$module/.*installed" ||
+                fail "$module DKMS not installed for $KREL"
+            echo "$module=PASS"
+        fi
+    done
+fi
+
+echo '=== Five held Ubuntu kernel packages ==='
+HEADER_BASE="${KREL%-generic}"
+for pkg in "linux-headers-$HEADER_BASE" "linux-headers-$KREL" \
+           "linux-modules-$KREL" "linux-image-unsigned-$KREL" "linux-lib-rust-$KREL"; do
+    [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null)" == 'hold ok installed' ]] ||
+        fail "Kernel package is missing or not held: $pkg"
+done
+echo 'CUSTOM_KERNEL_PACKAGES=5/5 HELD'
+
+echo '=== Promote verified kernel to permanent GRUB default ==='
+GRUB=/etc/default/grub
+[[ -f "$GRUB" ]] || fail 'GRUB configuration missing'
+FALLBACK_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux $RESCUE"
+PRODUCTION_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux $KREL"
+BACKUP="$STATE/grub.before-promotion.bak"
+cp -a "$GRUB" "$BACKUP" || fail 'Cannot save pre-promotion GRUB file'
+TEMP="$(mktemp "$STATE/grub-promotion-XXXXXXXX")"
+GRUB="$GRUB" TEMP="$TEMP" FALLBACK_ENTRY="$FALLBACK_ENTRY" \
+PRODUCTION_ENTRY="$PRODUCTION_ENTRY" python3 - <<'PY_PROMOTE'
+from pathlib import Path
+import os
+p = Path(os.environ['GRUB'])
+text = p.read_text()
+old = 'GRUB_DEFAULT="' + os.environ['FALLBACK_ENTRY'] + '"'
+new = 'GRUB_DEFAULT="' + os.environ['PRODUCTION_ENTRY'] + '"'
+if text.splitlines().count(old) != 1:
+    raise SystemExit('GRUB fallback was modified outside installer; cannot promote')
+Path(os.environ['TEMP']).write_text(text.replace(old, new, 1))
+PY_PROMOTE
+
+rollback_grub() {
+    cp -a "$BACKUP" "$GRUB" || true
+    update-grub > "$STATE/grub-promotion-rollback.log" 2>&1 || true
+}
+if ! sh -n "$TEMP" || ! install -m 0644 "$TEMP" "$GRUB" ||
+   ! update-grub > "$STATE/grub-promotion.log" 2>&1 ||
+   ! grub-script-check /boot/grub/grub.cfg ||
+   ! grep -Fq "menuentry 'Ubuntu, with Linux $KREL'" /boot/grub/grub.cfg ||
+   ! grep -Fq "menuentry 'Ubuntu, with Linux $RESCUE'" /boot/grub/grub.cfg ||
+   ! grep -Fxq "GRUB_DEFAULT=\"$PRODUCTION_ENTRY\"" "$GRUB"; then
+    rollback_grub
+    fail 'Could not safely promote verified kernel; GRUB fallback restored'
+fi
+
+if ! grub-editenv /boot/grub/grubenv unset next_entry; then
+    rollback_grub
+    fail 'Could not clear one-time boot override; GRUB fallback restored'
+fi
+
+echo "PERMANENT_KERNEL=$KREL"
+echo "FALLBACK_KERNEL=$RESCUE"
+echo 'FIRST_BOOT_VERIFICATION=PASS'
+echo 'NOTE: static initialization checks do not prove dynamic P2P coherency.'
+cp -a "$PENDING" "$STATE/completed.conf"
+rm -f "$PENDING"
+systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+POSTBOOT_HELPER
+
+# Create service only once; overwrite only our own previously generated service.
+if sudo test -e "/etc/systemd/system/$VERIFY_SERVICE"; then
+    sudo grep -Fq 'Description=MacPro2019LocalAI' \
+        "/etc/systemd/system/$VERIFY_SERVICE" ||
+        die "Existing service has an unexpected owner/name: $VERIFY_SERVICE"
+fi
+sudo install -d -m 0700 "$STATE_DIR" || die 'Could not create protected state directory'
+sudo install -m 0600 "$BASE/acs-targets.tsv" "$STATE_DIR/acs-targets.tsv" ||
+    die 'Could not install dynamic ACS bridge manifest'
+sudo install -m 0600 "$BASE/gpu-inventory.tsv" "$STATE_DIR/gpu-inventory.tsv" ||
+    die 'Could not install original GPU hardware/driver inventory'
+sudo install -m 0644 "$BASE/acs-topology-report.txt" "$STATE_DIR/acs-topology-report.txt" ||
+    die 'Could not install ACS topology report'
+sudo install -m 0755 "$BASE/postboot-verify.sh" "$VERIFY_HELPER" ||
+    die 'Could not install post-boot verification helper'
+cat > "$BASE/postboot-verify.service" <<'POSTBOOT_SERVICE'
+[Unit]
+Description=MacPro2019LocalAI first-boot verification and safe kernel promotion
+ConditionPathExists=/var/lib/macpro2019localai/pending.conf
+After=systemd-modules-load.service systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macpro2019localai-postboot-verify
+TimeoutStartSec=240
+
+[Install]
+WantedBy=multi-user.target
+POSTBOOT_SERVICE
+sudo install -m 0644 "$BASE/postboot-verify.service" \
+    "/etc/systemd/system/$VERIFY_SERVICE" || die 'Could not install post-boot service'
+sudo systemctl daemon-reload || die 'Cannot reload systemd manager'
+sudo systemctl enable "$VERIFY_SERVICE" > "$BASE/postboot-enable.log" 2>&1 ||
+    die 'Could not enable post-boot verification service'
+ok 'Automatic first-boot verification registered in systemd'
+
+# ----------------------------------------------------------------------------
+# STEP 8: Preserve the CURRENT WORKING kernel as persistent rescue target.
+# GRUB boots the new kernel just ONCE; verifier promotes only after PASS.
+# Do not use /etc/default/grub.d override files or custom menu entries.
+# ----------------------------------------------------------------------------
+banner 'STEP 8: Configure safe one-time boot into patched kernel'
+STEP='GRUB fallback and first-boot preparation'
+GRUB_FILE=/etc/default/grub
+[[ -f "$GRUB_FILE" ]] || die "$GRUB_FILE missing"
+BACKUP="/root/grub.before-${PROJECT}-${KREL}-${STAMP}.bak"
+sudo cp -a "$GRUB_FILE" "$BACKUP" || die 'Cannot back up original GRUB configuration'
+sudo cp -a "$GRUB_FILE" "$STATE_DIR/grub.original-before-trial.bak" ||
+    die 'Cannot preserve original kernel flags for failed-trial rollback'
+ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux $KREL"
+RESCUE_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux $RESCUE_KREL"
+GRUB_TMP="$(mktemp "$BASE/grub-main-XXXXXXXX")"
+GRUB_FILE="$GRUB_FILE" GRUB_TMP="$GRUB_TMP" ENTRY="$RESCUE_ENTRY" \
+  ACS_GRUB="$ACS_GRUB" python3 - <<'GRUB_PY'
+from pathlib import Path
+import os, re
+src = Path(os.environ['GRUB_FILE']).read_text()
+lines = src.splitlines()
+out = []
+count = {'GRUB_DEFAULT': 0, 'GRUB_CMDLINE_LINUX_DEFAULT': 0}
+for line in lines:
+    m = re.match(r'^(GRUB_DEFAULT|GRUB_CMDLINE_LINUX_DEFAULT)=(.*)$', line)
+    if not m:
+        out.append(line)
+        continue
+    key, value = m.groups()
+    count[key] += 1
+    if key == 'GRUB_DEFAULT':
+        out.append('GRUB_DEFAULT="' + os.environ['ENTRY'] + '"')
+        continue
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        raise SystemExit('GRUB_CMDLINE_LINUX_DEFAULT must have double quotes')
+    arguments = value[1:-1]
+    if re.search(r'(^|\s)iommu=\S+', arguments) and 'iommu=pt' not in arguments.split():
+        raise SystemExit('Conflicting IOMMU parameter already present; stop')
+    if 'iommu=pt' not in arguments.split():
+        arguments = (arguments + ' iommu=pt').strip()
+    # Replace the prior installer/user ACS selectors with freshly detected
+    # per-BDF selectors. Preserve every other original kernel argument.
+    old = list(re.finditer(r'(^|\s)pci=disable_acs_redir=\S+', arguments))
+    if len(old) > 1:
+        raise SystemExit('Conflicting multiple ACS kernel parameters')
+    if old:
+        match = old[0]
+        arguments = (arguments[:match.start()] + arguments[match.end():]).strip()
+    if os.environ['ACS_GRUB']:
+        arguments = (arguments + ' ' + os.environ['ACS_GRUB']).strip()
+    out.append(key + '="' + arguments + '"')
+if any(value != 1 for value in count.values()):
+    raise SystemExit('Expected exactly one GRUB_DEFAULT and one GRUB_CMDLINE_LINUX_DEFAULT')
+Path(os.environ['GRUB_TMP']).write_text('\n'.join(out) + '\n')
+GRUB_PY
+
+restore_grub() {
+    sudo cp -a "$BACKUP" "$GRUB_FILE" || warn 'Failed to restore original GRUB main file'
+    sudo update-grub > "$BASE/grub-restore.log" 2>&1 || warn 'GRUB restore regeneration failed'
+}
+if ! sh -n "$GRUB_TMP" || ! sudo install -m 0644 "$GRUB_TMP" "$GRUB_FILE"; then
+    restore_grub
+    die 'Proposed GRUB fallback config could not be installed'
+fi
+if ! sudo update-grub > "$BASE/grub-update.log" 2>&1 ||
+   ! sudo grub-script-check /boot/grub/grub.cfg ||
+   ! sudo grep -Fq "submenu 'Advanced options for Ubuntu'" /boot/grub/grub.cfg ||
+   ! sudo grep -Fq "menuentry 'Ubuntu, with Linux $KREL'" /boot/grub/grub.cfg ||
+   ! sudo grep -Fq "menuentry 'Ubuntu, with Linux $RESCUE_KREL'" /boot/grub/grub.cfg ||
+   ! sudo grep -Fq "menuentry 'Ubuntu, with Linux $STOCK_KREL'" /boot/grub/grub.cfg ||
+   ! grep -Fxq "GRUB_DEFAULT=\"$RESCUE_ENTRY\"" "$GRUB_FILE"; then
+    restore_grub
+    die 'GRUB verification failed; original configuration restored'
+fi
+GRUB_BOOT_LINE="$(sudo awk -v wanted="menuentry 'Ubuntu, with Linux $KREL'" '
+    index($0, wanted) {inside=1; next}
+    inside && /^[[:space:]]*linux[[:space:]]/ {print; exit}
+' /boot/grub/grub.cfg)"
+if [[ "$GRUB_BOOT_LINE" != *"vmlinuz-$KREL"* ||
+      "$GRUB_BOOT_LINE" != *'iommu=pt'* ]]; then
+    restore_grub
+    die 'New kernel GRUB command line lacks image or IOMMU flag'
+fi
+if (( ACS_TARGET_COUNT > 0 )) && [[ "$GRUB_BOOT_LINE" != *"$ACS_GRUB"* ]]; then
+    restore_grub
+    die 'New kernel GRUB command line lacks discovered ACS selectors'
+fi
+if (( ACS_TARGET_COUNT == 0 )) && [[ "$GRUB_BOOT_LINE" == *'pci=disable_acs_redir='* ]]; then
+    restore_grub
+    die 'New kernel GRUB command line lacks image or PCIe P2P flags'
+fi
+
+# The pending state is root-only and is parsed as DATA by the boot verifier.
+cat > "$BASE/pending.conf" <<PENDING_CONF
+CUSTOM_KERNEL=$KREL
+RESCUE_KERNEL=$RESCUE_KREL
+EXPECTED_GPU_COUNT=$AMD_GPUS_BEFORE
+EXPECTED_ALL_GPU_COUNT=$ALL_GPUS_BEFORE
+EXPECTED_ROCM_COUNT=$ROCM_BEFORE
+ACS_TARGET_COUNT=$ACS_TARGET_COUNT
+ACS_RUNTIME=$ACS_RUNTIME
+PENDING_CONF
+sudo install -m 0600 "$BASE/pending.conf" "$STATE_DIR/pending.conf" ||
+    die 'Cannot arm first-boot verification metadata'
+
+if ! sudo grub-reboot "$ENTRY"; then
+    sudo rm -f "$STATE_DIR/pending.conf"
+    restore_grub
+    die 'Could not arm the one-time trial boot'
+fi
+NEXT="$(sudo grub-editenv /boot/grub/grubenv list | sed -n 's/^next_entry=//p')"
+if [[ "$NEXT" != "$ENTRY" ]]; then
+    sudo grub-editenv /boot/grub/grubenv unset next_entry || true
+    sudo rm -f "$STATE_DIR/pending.conf"
+    restore_grub
+    die 'One-time GRUB boot entry was not armed correctly'
+fi
+
+printf 'RESCUE_KERNEL=%s\nBOOT_TRIAL=%s\nAUTO_VERIFY_SERVICE=%s\n' \
+    "$RESCUE_KREL" "$KREL" "$VERIFY_SERVICE" >> "$BASE/manifest.txt"
+
+banner "${PROJECT} - ONE-STEP INSTALLATION READY"
+info "Maintainer: $MAINTAINER"
+info "Official Ubuntu base: $SOURCE_VER | Trial kernel: $KREL"
+info "Current working kernel stays the fallback: $RESCUE_KREL"
+info "Official stock fallback also installed: $STOCK_KREL"
+info "Five custom packages held; dynamic ACS bridges: $ACS_TARGET_COUNT"
+info 'The FIRST boot uses grub-reboot (one-time).'
+info 'After a successful boot, systemd checks GPU counts, BARs, exact ACS BDFs, ROCm and DKMS.'
+info 'ONLY after a PASS will the verifier make the new kernel permanent.'
+info 'Direct P2P support and data correctness still require GPU peer-transfer tests.'
+info "Verification report: $STATE_DIR/last-verification.log"
+info "Build workspace and patch manifest: $BASE"
+if (( DO_REBOOT )); then
+    info 'One-paste workflow is now rebooting into the candidate kernel.'
+    sync
+    sudo reboot
+else
+    info 'Automatic verification is armed. Reboot manually to begin the one-time trial.'
+fi
+MACPRO2019LOCALAI_INSTALLER
